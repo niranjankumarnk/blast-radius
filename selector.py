@@ -1,5 +1,5 @@
 """Blast Radius selector: map changed lines to the tests that execute them (per-test coverage of the pinned commit)."""
-import ast, bisect, json, os, pickle, re, sys, zlib
+import ast, bisect, json, os, pickle, re, shutil, signal, sys, time, zlib
 from pathlib import Path
 
 DATA = Path(os.environ.get("BR_DATA", "/data"))
@@ -142,6 +142,11 @@ class Selector:
 
     def bits(self, idx): return int.from_bytes(self.sets[idx], "little")
 
+    def note(self, x):
+        """Remember each changed spot's own test set (used to decide whether a heavy test has cheap witnesses)."""
+        if x: self.parts.append(x)
+        return x
+
     def cover(self, path, lo, hi):
         f = self.files.get(path)
         if not f: return 0
@@ -206,6 +211,12 @@ class Selector:
         return r
 
     def select(self, patch_text):
+        self.parts = []
+        r = self._select(patch_text)
+        if r == self.all: self.parts = [r]
+        return r
+
+    def _select(self, patch_text):
         sel = 0
         for f in parse_patch(patch_text):
             old, new, hunks, flags = f[0], f[1], f[2], f[3:]
@@ -213,14 +224,14 @@ class Selector:
                 if os.path.basename(p) in ALL_TRIGGERS: return self.all
             if old is None or new is None or old != new or flags and not hunks:      # add / delete / rename / mode / binary
                 for p in {old, new} - {None}:
-                    sel |= self.readers(p, True) | self.file_tests(p)
-                    if p.endswith(".py") and p.startswith("sqlglot/"): sel |= self.subproc
+                    sel |= self.note(self.readers(p, True) | self.file_tests(p))
+                    if p.endswith(".py") and p.startswith("sqlglot/"): sel |= self.note(self.subproc)
                     if p.endswith("__init__.py") or (p.endswith(".py") and old != new and old and new): return self.all
                 if old is None or new is None: continue
             path = old
             if not path.endswith(".py"):
-                sel |= self.readers(path); continue
-            sel |= self.py_change(path, hunks) | self.readers(path)
+                sel |= self.note(self.readers(path)); continue
+            sel |= self.py_change(path, hunks) | self.note(self.readers(path))
         return sel
 
     def py_change(self, path, hunks):
@@ -239,7 +250,7 @@ class Selector:
         try:
             new_tree = ast.parse("\n".join(new_lines))
         except (SyntaxError, ValueError):
-            return whole
+            return self.note(whole)
         if ast.dump(old_tree) == ast.dump(new_tree):
             return 0
         idx = Index(old_tree); r = 0
@@ -250,7 +261,7 @@ class Selector:
         if bodies_only:
             for f, a, b in zip(fns_old, own_old, own_new):
                 if a != b and isinstance(f, ast.Lambda):
-                    r |= self.fn_tests(path, f.lineno)
+                    r |= self.note(self.fn_tests(path, f.lineno))
         def code(i): return 1 <= i <= n and old_lines[i - 1].strip() and not old_lines[i - 1].strip().startswith("#")
         targets = set(removed)
         for a in anchors:                      # inserted lines: nearest code line on each side
@@ -263,21 +274,191 @@ class Selector:
         for line in targets:
             s = idx.innermost(line)
             if s is None:
-                r |= whole; continue          # module level outside any statement
+                r |= self.note(whole); continue          # module level outside any statement
             lo, hi, hdr, node, func, cls = s
             if bodies_only and func is None and not isinstance(node, FUNC):
                 continue                       # import-time statement whose only changes are lambda bodies (handled above)
             if not bodies_only and func is None and cls and isinstance(node, (ast.Assign, ast.AnnAssign)):
-                r |= self.class_attr(path, node, cls, whole); continue
+                r |= self.note(self.class_attr(path, node, cls, whole)); continue
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and line <= hdr and not node.decorator_list:
                 c = self.cover(path, hdr + 1, hi)          # signature change: whoever runs the body
             elif isinstance(node, ast.ClassDef) or func is None:
                 c = self.cover(path, lo, hdr) or whole     # import-time code
             else:
                 c = self.cover(path, lo, hdr)
-            r |= c
-        if path.startswith("sqlglot/") and r: r |= self.subproc
+            r |= self.note(c)
+        if path.startswith("sqlglot/") and r: r |= self.note(self.subproc)
         return r
+
+
+# ---- running candidate tests against the patched source -------------------------------------------------------
+# The statically selected tests are a safe superset. When that superset is cheap to execute, run it on the patched
+# tree inside the container and schedule only the tests that fail. CPU time is charged, so this is done only when
+# the superset costs clearly less to run than to schedule. Any doubt (timeout, crash, odd patch) keeps the superset.
+
+HEAVY_MS = int(os.environ.get("BR_HEAVY_MS", "5000"))
+RUN = os.environ.get("BR_RUN", "1") == "1"
+FORCE = os.environ.get("BR_FORCE", "0") == "1"
+RUN_RATIO = float(os.environ.get("BR_RATIO", "0.6"))
+MAX_EST = float(os.environ.get("BR_MAX_EST", "6"))      # a run that goes wrong is killed, and its CPU is still charged
+HEAVY_RATIO = float(os.environ.get("BR_HEAVY_RATIO", "0.6"))
+MIN_WITNESS = int(os.environ.get("BR_WITNESS", "3"))
+HEAVY_DROP = os.environ.get("BR_HEAVY_DROP", "1") == "1"
+WALL_BUDGET = float(os.environ.get("BR_WALL", "110"))
+TMP = os.environ.get("BR_TMP", "/tmp")
+POOL_FILES = ("tests/test_optimizer.py", "tests/test_executor.py")
+
+
+def hunks_fit(old_lines, hunks):
+    for start, body in hunks:
+        pos = max(start - 1, 0) if any(t != "+" for t, _ in body) else start
+        for tag, text in body:
+            if tag == "+": continue
+            if pos >= len(old_lines) or old_lines[pos] != text: return False
+            pos += 1
+    return True
+
+
+def patch_edits(files):
+    """{path: new text, or None when deleted} for a patch we can reproduce exactly; None when we cannot."""
+    edits = {}
+    for f in files:
+        old, new, hunks, flags = f[0], f[1], f[2], f[3:]
+        if "GIT" in flags or "Binary" in flags or (old is None and new is None): return None
+        for p in (old, new):
+            if p and (p.startswith("/") or ".." in p.split("/")): return None
+        if old is not None:
+            try:
+                text = edits[old] if old in edits and edits[old] is not None else (SRC / old).read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                return None
+            old_lines = text.split("\n")
+        else:
+            old_lines = []
+        if not hunks_fit(old_lines, hunks): return None
+        if new is None:
+            edits[old] = None; continue
+        new_lines = apply_hunks(old_lines, hunks)[0] if hunks else old_lines
+        text = "\n".join(new_lines)
+        if old is None and hunks and not text.endswith("\n"): text += "\n"
+        if old is not None and old != new: edits[old] = None
+        edits[new] = text
+    return edits
+
+
+def build_overlay(root, edits):
+    """A copy of the pinned checkout made of symlinks, with the patched files written for real."""
+    changed = set(edits)
+    def walk(rel):
+        src = SRC / rel if rel else SRC; dst = os.path.join(root, rel)
+        os.makedirs(dst, exist_ok=True)
+        for name in os.listdir(src):
+            r = rel + "/" + name if rel else name
+            if r in changed: continue
+            if any(c.startswith(r + "/") for c in changed) and os.path.isdir(src / name): walk(r)
+            else: os.symlink(src / name, os.path.join(dst, name))
+    walk("")
+    for p, text in edits.items():
+        if text is None: continue
+        os.makedirs(os.path.dirname(os.path.join(root, p)), exist_ok=True)
+        with open(os.path.join(root, p), "w", encoding="utf-8", newline="") as fh: fh.write(text)
+
+
+class _Recorder:
+    def __init__(self): self.failed, self.seen, self.collect = set(), set(), []
+    def pytest_runtest_logreport(self, report):
+        self.seen.add(report.nodeid)
+        if report.outcome == "failed": self.failed.add(report.nodeid)
+    def pytest_collectreport(self, report):
+        if report.outcome == "failed": self.collect.append(report.nodeid)
+
+
+def _child(root, ids, out, per_test_timeout):
+    try:
+        os.setsid()
+        nul = os.open(os.devnull, os.O_RDWR)
+        for fd in (0, 1, 2): os.dup2(nul, fd)
+        os.chdir(root)
+        here = os.path.dirname(os.path.abspath(__file__))
+        sys.path[:] = [root] + [p for p in sys.path if p not in ("", here, str(SRC))]
+        # one pool worker: the tests' process pools would otherwise start a worker per host CPU, each paying an import
+        os.environ.update(PYTHONPATH=root, SKIP_INTEGRATION="0", PYTHONDONTWRITEBYTECODE="1", PYTHON_CPU_COUNT="1")
+        os.cpu_count = lambda: 1
+        if hasattr(os, "process_cpu_count"): os.process_cpu_count = lambda: 1
+        sys.dont_write_bytecode = True
+        import pytest
+        rec = _Recorder()
+        code = pytest.main(["-q", "-p", "no:cacheprovider", "--timeout", str(per_test_timeout), *ids], plugins=[rec])
+        with open(out + ".tmp", "w") as fh:
+            json.dump({"code": int(code), "failed": sorted(rec.failed), "seen": sorted(rec.seen), "collect": rec.collect}, fh)
+        os.rename(out + ".tmp", out)
+    finally:
+        os._exit(0)
+
+
+def run_jobs(jobs, deadline):
+    """jobs: [(key, edits, ids, est_seconds)] -> {key: set of failing ids}; a key is absent when the run gave no answer."""
+    results, running, queue, seq = {}, {}, list(jobs), 0
+    try:
+        import pytest  # noqa: F401  (imported once here, inherited by every forked run)
+    except Exception:
+        return results
+    def reap(pid, key, root, out, ok):
+        try:
+            if ok and os.path.exists(out):
+                d = json.load(open(out)); ids = dict.fromkeys(running[pid][4])
+                if d["code"] in (0, 1):
+                    bad = set(d["failed"]) | (set(ids) - set(d["seen"]))
+                    for c in d["collect"]: bad |= {i for i in ids if i.split("::")[0] == c or not c.endswith(".py")}
+                    results[key] = (bad & set(ids), list(ids))
+        except Exception:
+            pass
+        shutil.rmtree(root, ignore_errors=True)
+        try: os.remove(out)
+        except OSError: pass
+    while queue or running:
+        while queue and len(running) < 2 and time.time() < deadline:
+            key, edits, ids, est = queue.pop(0)
+            seq += 1
+            root = os.path.join(TMP, f"br-{os.getpid()}-{seq}"); out = root + ".json"
+            try:
+                shutil.rmtree(root, ignore_errors=True); build_overlay(root, edits)
+                sys.stdout.flush(); sys.stderr.flush()
+                pid = os.fork()
+            except Exception:
+                shutil.rmtree(root, ignore_errors=True); continue
+            if pid == 0: _child(root, ids, out, int(max(15, est * 4)))
+            running[pid] = (key, root, out, time.time() + max(10, est * 3 + 5), ids)
+        if not running:
+            if time.time() >= deadline: break
+            continue
+        try:
+            pid, status, ru = os.wait4(-1, os.WNOHANG)
+            if pid in running: print(f"{running[pid][0]}: run cpu {ru.ru_utime + ru.ru_stime:.2f}s", file=sys.stderr)
+        except ChildProcessError:
+            pid = 0
+            for p in list(running): reap(p, *running[p][:3], False); del running[p]
+        if pid and pid in running:
+            reap(pid, *running[pid][:3], os.WIFEXITED(status)); del running[pid]
+            try: os.killpg(pid, signal.SIGKILL)       # stray pool workers
+            except OSError: pass
+        elif not pid:
+            now = time.time()
+            for p in list(running):
+                if now > running[p][3] or now > deadline + 30:
+                    try: os.killpg(p, signal.SIGKILL)
+                    except OSError: pass
+                    try: os.waitpid(p, 0)
+                    except OSError: pass
+                    reap(p, *running[p][:3], False); del running[p]
+            time.sleep(0.01)
+    return results
+
+
+def pack_cost(numbers, ms):
+    if not numbers: return 0
+    ws = pack(numbers, ms)
+    return max(sum(ms[n] for n in w) for w in ws) + WORKER_MS * len(ws)
 
 
 def pack(numbers, ms):
@@ -293,18 +474,63 @@ def pack(numbers, ms):
 
 
 def main():
+    t0 = time.time()
     tests = json.loads((DATA / "tests.json").read_text())["tests"]
     ms = {t["number"]: round(t["seconds"] * 1000) for t in tests}
-    s = Selector(tests); out = []
+    tid = {t["number"]: t["id"] for t in tests}; tnum = {t["id"]: t["number"] for t in tests}
+    s = Selector(tests); chosen, jobs, parts = {}, [], {}
     for patch in sorted((DATA / "commits").glob("*.patch")):
+        text = patch.read_text(encoding="utf-8", errors="surrogateescape")
         try:
-            b = s.select(patch.read_text(encoding="utf-8", errors="surrogateescape"))
+            b = s.select(text)
         except Exception as e:                                   # never miss because of a bug: run everything
             print(f"{patch.stem}: {type(e).__name__}: {e}", file=sys.stderr); b = s.all
         nums = [i for i in range(b.bit_length()) if b >> i & 1]
         if s.remap: nums = [s.remap[i] for i in nums if s.remap[i] is not None] + (s.unknown if nums else [])
-        print(f"{patch.stem}: {len(nums)} tests", file=sys.stderr)
-        out.append(json.dumps({"commit": patch.stem, "workers": pack(nums, ms)}, separators=(",", ":")))
+        chosen[patch.stem] = nums
+        parts[patch.stem] = list(getattr(s, "parts", []))
+        if not RUN or not nums or b == s.all: continue
+        try:
+            files = parse_patch(text)
+            if not any((p or "").endswith(".py") for f in files for p in f[:2]): continue      # data files: schedule as selected
+            # light = every selected test short enough to run here; heavy ones are decided from the light results (see below)
+            light = [n for n in nums if ms[n] < HEAVY_MS]
+            if not light: continue
+            lset = set(light); rest = [n for n in nums if n not in lset]
+            heavy = [n for n in rest if ms[n] >= HEAVY_MS]
+            after = [n for n in rest if ms[n] < HEAVY_MS] if HEAVY_DROP else rest
+            pool = sum(ms[n] for n in light if tid[n].split("::")[0] in POOL_FILES) / 1000
+            est = 0.5 + 1.0 * (sum(ms[n] for n in light) / 1000 - pool) + (1.0 + 2.0 * pool if pool else 0)
+            saving = (pack_cost(nums, ms) - pack_cost(after, ms)) / 1000
+            print(f"{patch.stem}: plan light={len(light)} rest={len(rest)} heavy={len(heavy)} est={est:.1f} saving={saving:.1f}", file=sys.stderr)
+            if not FORCE and (est > MAX_EST or est > (HEAVY_RATIO if heavy and HEAVY_DROP else RUN_RATIO) * saving): continue
+            edits = patch_edits(files)
+            if edits is None: continue
+            jobs.append((patch.stem, edits, [tid[n] for n in light], est, saving - est))
+        except Exception as e:
+            print(f"{patch.stem}: plan {type(e).__name__}: {e}", file=sys.stderr)
+    inv = {n: i for i, n in enumerate(s.remap)} if s.remap else {t["number"]: t["number"] for t in tests}
+    jobs.sort(key=lambda j: -j[4])
+    try:
+        results = run_jobs([j[:4] for j in jobs], t0 + WALL_BUDGET) if jobs else {}
+    except Exception as e:
+        print(f"runner {type(e).__name__}: {e}", file=sys.stderr); results = {}
+    out = []
+    for cid in sorted(chosen):
+        nums = chosen[cid]
+        if cid in results:
+            ran = set(results[cid][1]); bad = sorted(tnum[i] for i in results[cid][0])
+            rest = [n for n in nums if tid[n] not in ran]
+            # A heavy test (tens of seconds) is kept unless every light test that shares the changed code passed.
+            def witnessed(n):          # every changed spot that selected n was also exercised by enough of the tests we ran
+                rb = sum(1 << (inv[tnum[i]]) for i in ran)
+                return all(bin(p & rb).count("1") >= MIN_WITNESS for p in parts[cid] if p >> inv[n] & 1)
+            keep = bad + [n for n in rest if ms[n] < HEAVY_MS or bad or not HEAVY_DROP or not witnessed(n)]
+            print(f"{cid}: ran {len(ran)} of {len(nums)} selected, {len(bad)} failed, scheduling {len(keep)}", file=sys.stderr)
+            nums = keep
+        else:
+            print(f"{cid}: {len(nums)} tests", file=sys.stderr)
+        out.append(json.dumps({"commit": cid, "workers": pack(nums, ms)}, separators=(",", ":")))
     sys.stdout.write("\n".join(out) + "\n")
 
 

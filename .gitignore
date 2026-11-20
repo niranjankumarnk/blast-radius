@@ -6,3 +6,8 @@ build/__pycache__/
 __pycache__/
 output.jsonl
 build/fn/
+gen/set*/
+gen/sampleval/
+gen/*.log
+gen/__pycache__/
+docker.err
