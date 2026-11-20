@@ -1,0 +1,7 @@
+.venv/
+sqlglot-src/
+build/
+sample/
+__pycache__/
+output.jsonl
+.git
