@@ -21,5 +21,6 @@ RUN python -m compileall -q /opt/sqlglot/sqlglot /opt/sqlglot/tests /app
 RUN cd /opt/sqlglot && export PYTHONPATH=/opt/sqlglot:/app PYTHONDONTWRITEBYTECODE=1 SKIP_INTEGRATION=0 \
     && python /app/gm_replay.py /app/gm_expected.json && python /app/tpcds_replay.py /app/tpcds_expected.json \
     && chmod -R a+rX /opt/sqlglot /app
-ENV PYTHONDONTWRITEBYTECODE=1
+# Variant: the static selection plus the exact unit replays only; no heavy test is dropped on witnesses.
+ENV PYTHONDONTWRITEBYTECODE=1 BR_RUN=0
 CMD ["python", "/app/selector.py"]
