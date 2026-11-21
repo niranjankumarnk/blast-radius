@@ -931,7 +931,8 @@ def run_once(edits, ids, est, deadline, label):
 # what the test needs, the test cannot fail and is not scheduled; otherwise it stays.
 GM_LIMIT = 512                    # bytes; the test asserts under 1,024 and the pinned commit measures 32
 EXACT = os.environ.get("BR_EXACT", "1") == "1"
-EXACT_RATIO = float(os.environ.get("BR_EXACT_RATIO", "0.7"))
+EXACT_RATIO = float(os.environ.get("BR_EXACT_RATIO", "0.8"))
+UNIT_MAX_EST = float(os.environ.get("BR_UNIT_MAX_EST", "18"))     # (a replay stops at the first unit that differs)
 UNIT_TESTS = (("tests/test_generator.py::TestGenerator::test_generator_memory", "gmap.bin", "gm_expected.json", "gm"),
               ("tests/test_executor.py::TestExecutor::test_execute_tpcds", "qmap.bin", "tpcds_expected.json", "tpcds"))
 
@@ -970,7 +971,49 @@ class Units:
         """units: [(unit, True to run it in full / False to compare only what its data phase is given)]"""
         # (tables are read from csv only when some query is executed; otherwise they come from the build's pickles)
         load = sum(self.exp["load"].get(t, 0) for t in {t for u, _ in units for t in self.exp["tables"][u]}) if self.kind == "tpcds" and any(f for _, f in units) else 0
-        return 0.6 + 1.2 * (sum(self.cost(i) for i in units) + load)
+        # (measured under emulation: 57 TPC-DS queries run in full, cost 15.4 s at the image build, took 14.3 s)
+        full = sum(self.cost(i) for i in units if i[1]) + load if self.kind == "tpcds" else 0
+        return 0.6 + 1.0 * full + 1.2 * (sum(self.cost(i) for i in units) + load - full)
+
+
+class Fixtures:
+    """The fixture-driven optimizer tests, fixture by fixture.
+
+    Such a test runs its own body and calls check_file, which optimizes every statement of a fixture file and
+    compares the result with the text stored next to it. fmap.bin holds, from the pinned commit, what check_file
+    executes for each single fixture (one unit per test, call and fixture, each measured in a fresh process, the
+    worker's part included). A patch that cannot reach a fixture's unit leaves that fixture's result as it is, so
+    the test's verdict is the verdict of the test run on the fixtures the patch can reach: the real test method,
+    its body in full, with the other fixtures left out."""
+
+    def __init__(self):
+        here = Path(__file__).parent; self.ok = False; self.memo = {}
+        try:
+            self.meta = json.loads((here / "fx_meta.json").read_text()); self.n = len(self.meta["units"])
+            self.sel = Selector([{"id": f"fx::{k}", "number": k} for k in range(self.n)], here / "fmap.bin")
+            self.ok = True
+        except Exception as e:
+            print(f"fixtures: off: {type(e).__name__}: {e}", file=sys.stderr)
+
+    def reach(self, cid, patch_text, test_id):
+        """-> ([fixture indexes the patch can reach, for each check_file call of the test], share of the test's
+        recorded time the narrowed run should take), or None when the test cannot be narrowed."""
+        t = self.meta["tests"].get(test_id)
+        if t is None: return None
+        if cid not in self.memo:
+            b = None
+            # (a patch to the tests or their fixtures changes what the units are)
+            if not any((p or "").startswith("tests/") for f in parse_patch(patch_text) for p in f[:2]):
+                b = self.sel.select(patch_text)
+                if b == self.sel.all: b = None
+            self.memo = {cid: b}
+        b = self.memo[cid]
+        if b is None: return None
+        calls, k, hit, total = [], t["first"], 0, 0
+        for n in t["calls"]:
+            calls.append([i for i in range(n) if b >> (k + i) & 1]); k += n; hit += len(calls[-1]); total += n
+        if hit == total: return None
+        return calls, t["body"] + (1 - t["body"]) * hit / max(1, total)
 
 
 def _units_child(root, kind, units, exp, out, tmpd):
@@ -1067,12 +1110,35 @@ def run_units(edits, obj, units, est, deadline, label):
 # cannot be loaded or is not reached stays scheduled, so a failure caused by the container costs time, never a miss.
 INPROC = os.environ.get("BR_INPROC", "1") == "1"
 INPROC_RATIO = float(os.environ.get("BR_INPROC_RATIO", "0.6"))
+FX = os.environ.get("BR_FX", "0") == "1"    # fixture-driven optimizer tests: run only the fixtures a patch can reach (off: about as much CPU as it saves)
 INPROC_POOL = os.environ.get("BR_INPROC_POOL", "0") == "1"       # also run tests of test_optimizer.py / test_executor.py (off: it costs more CPU than it saves)
 INPROC_OPT = [float(x) for x in os.environ.get("BR_INPROC_OPT", "0.6,1.8").split(",")]       # set-up seconds, CPU per recorded second
 INPROC_EXE = [float(x) for x in os.environ.get("BR_INPROC_EXE", "4.0,3.0").split(",")]
 
 
-def _inproc_child(root, ids, out, tmpd, limit):
+def _fixture_filter(spec):
+    """Make check_file, for the tests in spec ({test id: [fixture indexes for each of its check_file calls]}), see
+    only those fixtures. -> {test id: calls made}"""
+    M = sys.modules["tests.test_optimizer"]
+    real, load, seen = M.TestOptimizer.check_file, M.load_sql_fixture_pairs, {}
+
+    def check_file(self, *a, **k):
+        t = f"{POOL_FILES[0]}::TestOptimizer::{self._testMethodName}"
+        if t not in spec: return real(self, *a, **k)
+        c = seen.get(t, 0); seen[t] = c + 1
+        if c >= len(spec[t]): raise RuntimeError("more check_file calls than at the pinned commit")
+        keep = set(spec[t][c])
+        M.load_sql_fixture_pairs = lambda f: (p for i, p in enumerate(load(f)) if i in keep)
+        try:
+            return real(self, *a, **k)
+        finally:
+            M.load_sql_fixture_pairs = load
+
+    M.TestOptimizer.check_file = check_file
+    return seen
+
+
+def _inproc_child(root, ids, out, tmpd, limit, fx=None):
     try:
         os.setsid()
         nul = os.open(os.devnull, os.O_RDWR)
@@ -1104,6 +1170,7 @@ def _inproc_child(root, ids, out, tmpd, limit):
             except BaseException:
                 continue                                                 # not loadable here: stays scheduled
         if zyg is None and pooled: zyg = _pool_stand_in()
+        calls = _fixture_filter(fx) if fx else {}
 
         class Result(unittest.TestResult):
             def __init__(self):
@@ -1122,7 +1189,7 @@ def _inproc_child(root, ids, out, tmpd, limit):
         res = Result(); suite.run(res)
         signal.alarm(0)
         clean = not res.errors or all(cases.get(id(getattr(t, "test_case", t))) for t, _ in res.errors)      # (a class or module set-up error names no test)
-        passed = sorted(i for i in res.ok - res.bad if i) if clean else []
+        passed = sorted(i for i in res.ok - res.bad if i and (not fx or i not in fx or calls.get(i) == len(fx[i]))) if clean else []
         with open(out + ".tmp", "w") as fh: json.dump({"passed": passed}, fh)
         os.rename(out + ".tmp", out)
         if zyg is not None:
@@ -1266,7 +1333,7 @@ def numeric_ready():
 _NUMERIC = []
 
 
-def run_inproc(edits, ids, est, deadline, label):
+def run_inproc(edits, ids, est, deadline, label, fx=None):
     """-> the ids that passed on the patched tree, or None when the run gave no answer."""
     if time.time() >= deadline: return None
     if any(i.split("::")[0] in POOL_FILES for i in ids) and not numeric_ready(): return None
@@ -1283,7 +1350,7 @@ def run_inproc(edits, ids, est, deadline, label):
         pid = os.fork()
     except Exception:
         cleanup(); return None
-    if pid == 0: _inproc_child(base, ids, out, tmpd, limit)
+    if pid == 0: _inproc_child(base, ids, out, tmpd, limit, fx)
     end = time.time() + limit + 2; status = cpu = None
     while True:
         try:
@@ -1306,6 +1373,7 @@ def run_inproc(edits, ids, est, deadline, label):
     except Exception:
         res = None
     cleanup()
+    if fx: label += f" ({len(fx)} narrowed to {sum(len(c) for v in fx.values() for c in v)} fixtures)"
     print(f"{label}: ran {len(ids)} tests in-process, {'no answer' if res is None else str(len(res)) + ' passed'}, cpu {cpu if cpu is None else round(cpu, 2)} s", file=sys.stderr)
     return res
 
@@ -1397,7 +1465,7 @@ def main():
                 est = obj.estimate(us)
                 saving = (pack_cost(nums, ms) - pack_cost([n for n in nums if n != obj.test], ms)) / 1000
                 print(f"{cid}: {obj.kind} affects {len(us)} of {obj.n} units ({sum(1 for _, f in us if f)} to run in full) est={est:.1f} saving={saving:.1f}", file=sys.stderr)
-                if est <= MAX_EST and est <= EXACT_RATIO * saving: ejobs.append((saving - est, cid, obj, us, est))
+                if est <= UNIT_MAX_EST and est <= EXACT_RATIO * saving: ejobs.append((saving - est, cid, obj, us, est))
             except Exception as e:
                 print(f"{cid}: units {type(e).__name__}: {e}", file=sys.stderr)
     for _, cid, obj, us, est in sorted(ejobs, key=lambda j: -j[0]):
@@ -1415,13 +1483,17 @@ def main():
             print(f"{cid}: replay {type(e).__name__}: {e}", file=sys.stderr)
     # Cheap selections: run what can be run in-process and schedule only what did not pass.
     ijobs = []
+    fixtures = Fixtures() if FX and INPROC and not s.remap else None
     for cid, nums in chosen.items() if INPROC and not s.remap else ():
         try:
             if cid not in texts: continue
             if not any((p or "").endswith(".py") for f in parse_patch(texts[cid]) for p in f[:2]): continue
             run = [n for n in nums if ms[n] < HEAVY_MS and (INPROC_POOL or tid[n].split("::")[0] not in POOL_FILES) and tid[n].split("::")[0] not in s.resolvers() and tid[n].count("::") == 2]
-            if not run: continue
-            files = {tid[n].split("::")[0] for n in run}
+            narrowed = {}
+            for n in nums if fixtures is not None and fixtures.ok else ():
+                r = fixtures.reach(cid, texts[cid], tid[n]) if n not in run else None
+                if r is not None: narrowed[n] = r
+            if not run and not narrowed: continue
             t_opt = sum(ms[n] for n in run if tid[n].split("::")[0] == POOL_FILES[0]) / 1000
             t_exe = sum(ms[n] for n in run if tid[n].split("::")[0] == POOL_FILES[1]) / 1000
             # (measured under emulation: 0.16-0.64 s for 1-6 plain tests. Optimizer tests: 0.55-0.65 s for one tiny test,
@@ -1429,15 +1501,22 @@ def main():
             # Executor tests: 4-5.5 s before the first test runs, 9.9 s for the 56 small ones (1.35 s recorded).)
             est = (0.25 + 0.6 * (sum(ms[n] for n in run) / 1000 - t_opt - t_exe)
                    + (INPROC_OPT[0] + INPROC_OPT[1] * t_opt if t_opt else 0) + (INPROC_EXE[0] + INPROC_EXE[1] * t_exe if t_exe else 0))
-            gain = (pack_cost(nums, ms) - pack_cost([n for n in nums if n not in set(run)], ms)) / 1000
-            if est <= INPROC_RATIO * gain: ijobs.append((gain - est, cid, run, est))
+            # (a narrowed fixture test: the optimizer set-up once, then about 2 s of CPU per recorded second it still runs)
+            est_fx = (0 if t_opt else INPROC_OPT[0]) + sum(2.0 * ms[n] / 1000 * share for n, (_, share) in narrowed.items())
+            best = None
+            for part, e in ((run, est), (run + sorted(narrowed), est + est_fx), (sorted(narrowed), 0.25 + INPROC_OPT[0] + est_fx - (0 if t_opt else INPROC_OPT[0]))):
+                if not part or (part is not run and not narrowed): continue
+                gain = (pack_cost(nums, ms) - pack_cost([n for n in nums if n not in set(part)], ms)) / 1000
+                if e <= INPROC_RATIO * gain and (best is None or gain - e > best[0]):
+                    best = (gain - e, cid, part, e, {tid[n]: narrowed[n][0] for n in part if n in narrowed})
+            if best: ijobs.append(best)
         except Exception as e:
             print(f"{cid}: in-process plan {type(e).__name__}: {e}", file=sys.stderr)
-    for _, cid, run, est in sorted(ijobs, key=lambda j: -j[0]):
+    for _, cid, run, est, fx in sorted(ijobs, key=lambda j: -j[0]):
         try:
             if cid not in edits_of: edits_of[cid] = patch_edits(parse_patch(texts[cid]))
             if edits_of[cid] is None: continue
-            passed = run_inproc(edits_of[cid], [tid[n] for n in run], est, t0 + WALL_BUDGET, cid)
+            passed = run_inproc(edits_of[cid], [tid[n] for n in run], est, t0 + WALL_BUDGET, cid, fx)
             if passed: chosen[cid] = [n for n in chosen[cid] if tid[n] not in passed]
         except Exception as e:
             print(f"{cid}: in-process {type(e).__name__}: {e}", file=sys.stderr)

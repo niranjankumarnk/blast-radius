@@ -17,6 +17,7 @@ r0 = resource.getrusage(resource.RUSAGE_CHILDREN)
 p = subprocess.run([os.path.join(here, ".venv/bin/python"), os.path.join(here, "selector.py")], env=env, capture_output=True)
 r1 = resource.getrusage(resource.RUSAGE_CHILDREN); cpu = r1.ru_utime + r1.ru_stime - r0.ru_utime - r0.ru_stime
 shutil.rmtree(tmp)
+if os.environ.get("EV_LOG"): open(os.environ["EV_LOG"], "w").write(p.stderr.decode())
 if p.returncode: print(p.stderr.decode()[-3000:]); sys.exit(1)
 log = {l.split(":")[0]: l for l in p.stderr.decode().splitlines() if ": ran " in l}
 tot = miss = ideal = 0; rows = []

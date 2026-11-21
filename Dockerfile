@@ -14,7 +14,7 @@ with tarfile.open(fileobj=io.BytesIO(data)) as tar:
         m.name = m.name.split("/", 1)[1]
     tar.extractall("/opt/sqlglot", members=members, filter="data")
 PY
-COPY selector.py map.bin gmap.bin qmap.bin emap.bin gm_replay.py tpcds_replay.py /app/
+COPY selector.py map.bin gmap.bin qmap.bin emap.bin fmap.bin fx_meta.json gm_replay.py tpcds_replay.py /app/
 RUN python -m compileall -q /opt/sqlglot/sqlglot /opt/sqlglot/tests /app
 # What the two replayable heavy tests need from every unit on the pinned commit (memory growth per dialect, a digest
 # of the DuckDB SQL and executor result per TPC-DS query) and what each unit costs in CPU, measured on this machine.

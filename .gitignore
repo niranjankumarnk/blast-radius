@@ -33,3 +33,9 @@ build/q/phase/
 gen/phase_lines.json
 tpcds_expected.json.tables
 gen/set*cval.log
+build/f/iso/
+build/f/fn/
+build/f/tests.json
+build/f/calls.pkl
+build/f/*.log
+build/f/__pycache__/
