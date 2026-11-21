@@ -1,7 +1,8 @@
 # Blast Radius entry
 
-Picks the tests a patch to sqlglot (pinned at `eb11aec4be8cb2122afe713a4816662c3f0fb2fa`) can break. It reads the
-patch and the pinned source and runs no test.
+Picks the tests a patch to sqlglot (pinned at `eb11aec4be8cb2122afe713a4816662c3f0fb2fa`) can break, from the
+patch and the pinned source. For the few selections that carry a very slow test it also runs the cheaper selected
+tests in the container (see "Heavy tests").
 
 ## How it works
 
@@ -35,8 +36,20 @@ or removed, or passes a point where one was inserted:
 
 Selected tests are packed longest-first onto 1 to 8 workers, whichever count costs least.
 
-`selector.py` can also run selected tests in the container against the patched tree (`BR_RUN=1`). That is off: on
-the practice set it cost more CPU than it saved.
+## Heavy tests
+
+Three tests take 6 to 29 seconds each, so one of them decides the cost of any commit that selects it. When a
+selection carries one, and the cheaper selected tests are cheap enough to run (an estimate from measured CPU
+times), the selector runs those cheaper tests in the container against the patched tree: a symlink copy of the
+pinned checkout in `/tmp` with the patched files written for real, `requirements.lock` installed, pytest in a
+forked child. The heavy test is left out only if every cheaper selected test passes and at least three of them
+exercise each changed spot that selected the heavy test. This is a bet, not a proof: the heavy test could still be
+the only one that fails.
+
+- A test that fails on the patched tree is re-run on the unpatched tree. If it fails there too, the container
+  cannot judge it: it keeps its static decision and is not counted for or against the heavy test.
+- A timeout, a crash, or a patch that cannot be reproduced exactly keeps the static selection.
+- `BR_RUN=0` turns all of this off.
 
 ## Rebuild the map
 

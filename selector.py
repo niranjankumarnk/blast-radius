@@ -733,10 +733,11 @@ class Selector:
         return r
 
 
-# ---- running candidate tests against the patched source -------------------------------------------------------
-# The statically selected tests are a safe superset. When that superset is cheap to execute, run it on the patched
-# tree inside the container and schedule only the tests that fail. CPU time is charged, so this is done only when
-# the superset costs clearly less to run than to schedule. Any doubt (timeout, crash, odd patch) keeps the superset.
+# ---- deciding a heavy test by running the cheaper selected tests ---------------------------------------------
+# The statically selected tests are a safe superset. When it carries a test of five seconds or more, the cheaper
+# selected tests are run inside the container against the patched tree; if they all pass, the heavy test is not
+# scheduled. CPU time is charged, so this is done only when the run costs clearly less than the heavy test. Any
+# doubt (timeout, crash, a patch that cannot be reproduced exactly) keeps the static selection.
 
 STRUCT = os.environ.get("BR_STRUCT", "new")        # new: statement-level comparison; union: plus the older line-based rules
 # A test that starts a Python subprocess is selected through its coverage like any other: the map traces child
@@ -744,17 +745,15 @@ STRUCT = os.environ.get("BR_STRUCT", "new")        # new: statement-level compar
 # selection for a sqlglot/ change instead.
 SUBPROC = os.environ.get("BR_SUBPROC", "0") == "1"
 HEAVY_MS = int(os.environ.get("BR_HEAVY_MS", "5000"))
-RUN = os.environ.get("BR_RUN", "0") == "1"          # running tests in the container is off: it cost more CPU than it saved
+RUN = os.environ.get("BR_RUN", "1") == "1"             # decide heavy tests by running the cheaper selected tests
 FORCE = os.environ.get("BR_FORCE", "0") == "1"
-RUN_RATIO = float(os.environ.get("BR_RATIO", "0.45"))      # about half the commits that select tests break none
-MAX_EST = float(os.environ.get("BR_MAX_EST", "6"))      # a run that goes wrong is killed, and its CPU is still charged
+MAX_EST = float(os.environ.get("BR_MAX_EST", "14"))    # a run that goes wrong is killed, and its CPU is still charged
 HEAVY_RATIO = float(os.environ.get("BR_HEAVY_RATIO", "0.6"))
 MIN_WITNESS = int(os.environ.get("BR_WITNESS", "3"))
-HEAVY_DROP = os.environ.get("BR_HEAVY_DROP", "1") == "1"
+KEEP_WITNESSES = os.environ.get("BR_KEEP_WITNESSES", "0") == "1"
 WALL_BUDGET = float(os.environ.get("BR_WALL", "110"))
 TMP = os.environ.get("BR_TMP", "/tmp")
 POOL_FILES = ("tests/test_optimizer.py", "tests/test_executor.py")
-CONCURRENCY = int(os.environ.get("BR_JOBS", "1"))      # one at a time: test processes start many threads, and pids are limited
 
 
 def hunks_fit(old_lines, hunks):
@@ -823,7 +822,7 @@ class _Recorder:
         if report.outcome == "failed": self.collect.append(report.nodeid)
 
 
-def _child(root, ids, out, per_test_timeout):
+def _child(root, ids, out, tmpd, per_test_timeout):
     try:
         os.setsid()
         nul = os.open(os.devnull, os.O_RDWR)
@@ -833,12 +832,14 @@ def _child(root, ids, out, per_test_timeout):
             with open("/proc/self/oom_score_adj", "w") as fh: fh.write("1000")
         except OSError:
             pass
-        os.makedirs(root + ".tmp", exist_ok=True); os.environ["TMPDIR"] = root + ".tmp"
-        import tempfile; tempfile.tempdir = None
+        import tempfile
+        os.environ["TMPDIR"] = tmpd; tempfile.tempdir = None
         here = os.path.dirname(os.path.abspath(__file__))
-        sys.path[:] = [root] + [p for p in sys.path if p not in ("", here, str(SRC))]
-        # one pool worker: the tests' process pools would otherwise start a worker per host CPU, each paying an import
-        os.environ.update(PYTHONPATH=root, SKIP_INTEGRATION="0", PYTHONDONTWRITEBYTECODE="1", PYTHON_CPU_COUNT="1")
+        sys.path[:] = [root] + [p for p in sys.path if p not in ("", here, str(SRC), root)]
+        # One pool worker and one thread per library: the tests' process pools and the numeric libraries would
+        # otherwise start one per host CPU, each paying an import and counting against the process limit.
+        os.environ.update(PYTHONPATH=root, SKIP_INTEGRATION="0", PYTHONDONTWRITEBYTECODE="1", PYTHON_CPU_COUNT="1",
+                          OPENBLAS_NUM_THREADS="1", OMP_NUM_THREADS="1", MKL_NUM_THREADS="1", NUMEXPR_NUM_THREADS="1")
         os.cpu_count = lambda: 1
         if hasattr(os, "process_cpu_count"): os.process_cpu_count = lambda: 1
         sys.dont_write_bytecode = True
@@ -852,63 +853,62 @@ def _child(root, ids, out, per_test_timeout):
         os._exit(0)
 
 
-def run_jobs(jobs, deadline):
-    """jobs: [(key, edits, ids, est_seconds)] -> {key: set of failing ids}; a key is absent when the run gave no answer."""
-    results, running, queue, seq = {}, {}, list(jobs), 0
+_SEQ = [0]
+
+
+def run_once(edits, ids, est, deadline, label):
+    """Run tests with pytest in a forked child, against the patched tree (edits) or the pinned tree (edits is None).
+    -> the set of failing ids, or None when the run gave no usable answer."""
+    if time.time() >= deadline: return None
     try:
         import pytest  # noqa: F401  (imported once here, inherited by every forked run)
     except Exception:
-        return results
-    def reap(pid, key, root, out, ok):
-        try:
-            if ok and os.path.exists(out):
-                d = json.load(open(out)); ids = dict.fromkeys(running[pid][4])
-                if d["code"] in (0, 1):
-                    bad = set(d["failed"]) | (set(ids) - set(d["seen"]))
-                    for c in d["collect"]: bad |= {i for i in ids if i.split("::")[0] == c or not c.endswith(".py")}
-                    results[key] = (bad & set(ids), list(ids))
-        except Exception:
-            pass
-        shutil.rmtree(root, ignore_errors=True); shutil.rmtree(root + ".tmp", ignore_errors=True)
+        return None
+    _SEQ[0] += 1
+    base = os.path.join(TMP, f"br-{os.getpid()}-{_SEQ[0]}"); out = base + ".json"; tmpd = base + ".tmp"; root = str(SRC)
+    def cleanup():
+        if edits is not None: shutil.rmtree(base, ignore_errors=True)
+        shutil.rmtree(tmpd, ignore_errors=True)
         try: os.remove(out)
         except OSError: pass
-    while queue or running:
-        while queue and len(running) < CONCURRENCY and time.time() < deadline:
-            key, edits, ids, est = queue.pop(0)
-            seq += 1
-            root = os.path.join(TMP, f"br-{os.getpid()}-{seq}"); out = root + ".json"
-            try:
-                shutil.rmtree(root, ignore_errors=True); build_overlay(root, edits)
-                sys.stdout.flush(); sys.stderr.flush()
-                pid = os.fork()
-            except Exception:
-                shutil.rmtree(root, ignore_errors=True); continue
-            if pid == 0: _child(root, ids, out, int(max(15, est * 4)))
-            running[pid] = (key, root, out, time.time() + max(10, est * 3 + 5), ids)
-        if not running:
-            if time.time() >= deadline: break
-            continue
+    try:
+        if edits is not None:
+            root = base; shutil.rmtree(root, ignore_errors=True); build_overlay(root, edits)
+        os.makedirs(tmpd, exist_ok=True)
+        sys.stdout.flush(); sys.stderr.flush()
+        pid = os.fork()
+    except Exception:
+        cleanup(); return None
+    if pid == 0: _child(root, ids, out, tmpd, int(max(20, est * 4)))
+    limit = time.time() + max(20, est * 3 + 10); status = cpu = None
+    while True:
         try:
-            pid, status, ru = os.wait4(-1, os.WNOHANG)
-            if pid in running: print(f"{running[pid][0]}: run cpu {ru.ru_utime + ru.ru_stime:.2f}s", file=sys.stderr)
+            p, st, ru = os.wait4(pid, os.WNOHANG)
         except ChildProcessError:
-            pid = 0
-            for p in list(running): reap(p, *running[p][:3], False); del running[p]
-        if pid and pid in running:
-            reap(pid, *running[pid][:3], os.WIFEXITED(status)); del running[pid]
-            try: os.killpg(pid, signal.SIGKILL)       # stray pool workers
-            except OSError: pass
-        elif not pid:
-            now = time.time()
-            for p in list(running):
-                if now > running[p][3] or now > deadline + 30:
-                    try: os.killpg(p, signal.SIGKILL)
-                    except OSError: pass
-                    try: os.waitpid(p, 0)
-                    except OSError: pass
-                    reap(p, *running[p][:3], False); del running[p]
-            time.sleep(0.01)
-    return results
+            break
+        if p == pid:
+            status, cpu = st, ru.ru_utime + ru.ru_stime; break
+        if time.time() > limit: break
+        time.sleep(0.01)
+    try: os.killpg(pid, signal.SIGKILL)                   # the run if it is still going, and any stray pool worker
+    except OSError: pass
+    try:
+        while os.waitpid(-1, 0 if status is None else os.WNOHANG)[0] > 0 and status is not None: pass
+    except ChildProcessError:
+        pass
+    res = None
+    try:
+        if status is not None and os.WIFEXITED(status) and os.path.exists(out):
+            d = json.load(open(out))
+            if d["code"] in (0, 1):
+                idset = set(ids); bad = set(d["failed"]) | (idset - set(d["seen"]))
+                for c in d["collect"]: bad |= {i for i in idset if i.split("::")[0] == c or not c.endswith(".py")}
+                res = bad & idset
+    except Exception:
+        res = None
+    cleanup()
+    print(f"{label}: ran {len(ids)} tests, {'no answer' if res is None else str(len(res)) + ' failed'}, cpu {cpu if cpu is None else round(cpu, 2)} s", file=sys.stderr)
+    return res
 
 
 def pack_cost(numbers, ms):
@@ -929,12 +929,28 @@ def pack(numbers, ms):
     return best[1]
 
 
+def run_estimate(wit, ms, tid):
+    """CPU seconds a witness run is expected to use on the scorer (measured under amd64 emulation, taken at face value)."""
+    files = {tid[n].split("::")[0] for n in wit}
+    return (1.3 + (5.5 if "tests/test_executor.py" in files else 0) + (7.0 if "tests/test_optimizer.py" in files else 0)
+            + 1.3 * sum(ms[n] for n in wit) / 1000)
+
+
 def main():
     t0 = time.time()
     tests = json.loads((DATA / "tests.json").read_text())["tests"]
     ms = {t["number"]: round(t["seconds"] * 1000) for t in tests}
     tid = {t["number"]: t["id"] for t in tests}; tnum = {t["id"]: t["number"] for t in tests}
-    s = Selector(tests); chosen, jobs, parts = {}, [], {}
+    s = Selector(tests); chosen, parts, edits_of, jobs = {}, {}, {}, []
+    inv = {n: i for i, n in enumerate(s.remap)} if s.remap else {t["number"]: t["number"] for t in tests}
+    def witness_plan(cid, broken):
+        """(heavy tests, witnesses) when the commit's heavy tests can be decided by its cheaper selected tests."""
+        nums = chosen[cid]
+        heavy = [n for n in nums if ms[n] >= HEAVY_MS]
+        wit = [n for n in nums if ms[n] < HEAVY_MS and tid[n].split("::")[0] not in s.resolvers() and tid[n] not in broken]
+        wb = sum(1 << inv[n] for n in wit)
+        ok = heavy and wit and all(bin(p & wb).count("1") >= MIN_WITNESS for p in parts[cid] if any(p >> inv[h] & 1 for h in heavy))
+        return (heavy, wit) if ok else (None, None)
     for patch in sorted((DATA / "commits").glob("*.patch")):
         text = patch.read_text(encoding="utf-8", errors="surrogateescape")
         try:
@@ -945,48 +961,52 @@ def main():
         if s.remap: nums = [s.remap[i] for i in nums if s.remap[i] is not None] + (s.unknown if nums else [])
         chosen[patch.stem] = nums
         parts[patch.stem] = list(getattr(s, "parts", []))
-        if not RUN or not nums or b == s.all: continue
+        if not RUN or not nums or b == s.all or s.remap: continue
         try:
+            # Only a selection that carries a heavy test (five seconds or more) is worth a run: the heavy test is
+            # dropped when every cheaper selected test passes on the patched tree and at least MIN_WITNESS of them
+            # exercise each changed spot that selected it. Cheap selections are scheduled as selected.
+            heavy, wit = witness_plan(patch.stem, ())
+            if not heavy: continue
             files = parse_patch(text)
-            if not any((p or "").endswith(".py") for f in files for p in f[:2]): continue      # data files: schedule as selected
-            # light = every selected test short enough to run here; heavy ones are decided from the light results (see below)
-            light = [n for n in nums if ms[n] < HEAVY_MS and tid[n].split("::")[0] not in s.resolvers()]
-            if not light: continue
-            lset = set(light); rest = [n for n in nums if n not in lset]
-            heavy = [n for n in rest if ms[n] >= HEAVY_MS]
-            after = [n for n in rest if ms[n] < HEAVY_MS] if HEAVY_DROP else rest
-            pool = sum(ms[n] for n in light if tid[n].split("::")[0] in POOL_FILES) / 1000
-            est = 0.4 + 1.0 * (sum(ms[n] for n in light) / 1000 - pool) + (1.0 + 2.0 * pool if pool else 0)
+            if not any((p or "").endswith(".py") for f in files for p in f[:2]): continue
+            est = run_estimate(wit, ms, tid)
+            after = [n for n in nums if n not in heavy and (KEEP_WITNESSES or n not in wit)]
             saving = (pack_cost(nums, ms) - pack_cost(after, ms)) / 1000
-            print(f"{patch.stem}: plan light={len(light)} rest={len(rest)} heavy={len(heavy)} est={est:.1f} saving={saving:.1f}", file=sys.stderr)
-            if not FORCE and (est > MAX_EST or est > (HEAVY_RATIO if heavy and HEAVY_DROP else RUN_RATIO) * saving): continue
+            print(f"{patch.stem}: plan heavy={len(heavy)} witnesses={len(wit)} est={est:.1f} saving={saving:.1f}", file=sys.stderr)
+            if not FORCE and (est > MAX_EST or est > HEAVY_RATIO * saving): continue
             edits = patch_edits(files)
             if edits is None: continue
-            jobs.append((patch.stem, edits, [tid[n] for n in light], est, saving - est))
+            edits_of[patch.stem] = edits; jobs.append((saving - est, patch.stem))
         except Exception as e:
             print(f"{patch.stem}: plan {type(e).__name__}: {e}", file=sys.stderr)
-    inv = {n: i for i, n in enumerate(s.remap)} if s.remap else {t["number"]: t["number"] for t in tests}
-    jobs.sort(key=lambda j: -j[4])
-    try:
-        results = run_jobs([j[:4] for j in jobs], t0 + WALL_BUDGET) if jobs else {}
-    except Exception as e:
-        print(f"runner {type(e).__name__}: {e}", file=sys.stderr); results = {}
+    broken = set()                 # tests that fail here on the unpatched tree: this container cannot judge them
+    for _, cid in sorted(jobs, reverse=True):
+        try:
+            deadline = t0 + WALL_BUDGET
+            heavy, wit = witness_plan(cid, broken)
+            if not heavy: continue
+            ids = [tid[n] for n in wit]; est = run_estimate(wit, ms, tid)
+            bad = run_once(edits_of[cid], ids, est, deadline, cid)
+            if bad is None: continue                                     # no answer: keep the static selection
+            if bad:
+                # A failure counts only if the same test passes here on the unpatched tree. Otherwise it is this
+                # container's doing: the test keeps its static decision and is not run again.
+                again = run_once(None, sorted(bad), run_estimate([tnum[i] for i in bad], ms, tid), deadline, cid + " (unpatched)")
+                if again is None: continue
+                broken |= again
+                if bad - again: continue                                 # a real failure: keep the static selection
+                heavy, wit = witness_plan(cid, broken)                   # the rule must still hold without the unjudged tests
+                if not heavy: continue
+            dropped = set(heavy) | (set() if KEEP_WITNESSES else set(wit))
+            chosen[cid] = [n for n in chosen[cid] if n not in dropped]
+            print(f"{cid}: {len(wit)} cheaper tests pass: dropped {len(heavy)} heavy, scheduling {len(chosen[cid])}", file=sys.stderr)
+        except Exception as e:
+            print(f"{cid}: run {type(e).__name__}: {e}", file=sys.stderr)
     out = []
     for cid in sorted(chosen):
-        nums = chosen[cid]
-        if cid in results:
-            ran = set(results[cid][1]); bad = sorted(tnum[i] for i in results[cid][0])
-            rest = [n for n in nums if tid[n] not in ran]
-            # A heavy test (tens of seconds) is kept unless every light test that shares the changed code passed.
-            def witnessed(n):          # every changed spot that selected n was also exercised by enough of the tests we ran
-                rb = sum(1 << (inv[tnum[i]]) for i in ran)
-                return all(bin(p & rb).count("1") >= MIN_WITNESS for p in parts[cid] if p >> inv[n] & 1)
-            keep = bad + [n for n in rest if ms[n] < HEAVY_MS or bad or not HEAVY_DROP or not witnessed(n)]
-            print(f"{cid}: ran {len(ran)} of {len(nums)} selected, {len(bad)} failed, scheduling {len(keep)}", file=sys.stderr)
-            nums = keep
-        else:
-            print(f"{cid}: {len(nums)} tests", file=sys.stderr)
-        out.append(json.dumps({"commit": cid, "workers": pack(nums, ms)}, separators=(",", ":")))
+        print(f"{cid}: {len(chosen[cid])} tests", file=sys.stderr)
+        out.append(json.dumps({"commit": cid, "workers": pack(chosen[cid], ms)}, separators=(",", ":")))
     sys.stdout.write("\n".join(out) + "\n")
 
 

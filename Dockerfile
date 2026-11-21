@@ -1,7 +1,9 @@
 # Scorer builds on linux/amd64, runs with no network as user nobody. Same base image the commits were labeled in.
 FROM python:3.13-slim@sha256:e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf1070bc106ee9ed90
-# The pinned sqlglot checkout, from sqlglot's own repository: the selector reads its source to compare each patch
-# against it. Nothing is installed and no test is run.
+# The environment the commits were labeled in, so the selector can run selected tests against a patched tree.
+COPY requirements.lock /app/requirements.lock
+RUN pip install --no-cache-dir --disable-pip-version-check -r /app/requirements.lock
+# The pinned sqlglot checkout (source, tests and fixtures), from sqlglot's own repository.
 RUN python - <<'PY'
 import io, tarfile, urllib.request
 sha = "eb11aec4be8cb2122afe713a4816662c3f0fb2fa"
@@ -13,6 +15,6 @@ with tarfile.open(fileobj=io.BytesIO(data)) as tar:
     tar.extractall("/opt/sqlglot", members=members, filter="data")
 PY
 COPY selector.py map.bin /app/
-RUN python -m compileall -q /app && chmod -R a+rX /opt/sqlglot /app
+RUN python -m compileall -q /opt/sqlglot/sqlglot /opt/sqlglot/tests /app && chmod -R a+rX /opt/sqlglot /app
 ENV PYTHONDONTWRITEBYTECODE=1
 CMD ["python", "/app/selector.py"]
