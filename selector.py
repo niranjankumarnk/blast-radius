@@ -860,10 +860,15 @@ _SEQ = [0]
 
 def run_once(edits, ids, est, deadline, label):
     """Run tests with pytest in a forked child, against the patched tree (edits) or the pinned tree (edits is None).
-    -> the set of failing ids, or None when the run gave no usable answer."""
+    -> (failing ids, ids that passed), or None when the run gave no usable answer."""
     if time.time() >= deadline: return None
     try:
         import pytest  # noqa: F401  (imported once here, inherited by every forked run)
+        if any(i.split("::")[0] in POOL_FILES for i in ids):
+            # These two test files import pandas, duckdb and numpy: seconds of CPU per process. Import them once
+            # here, single-threaded so that no thread exists at the fork; sqlglot itself is never imported here.
+            os.environ.update(OPENBLAS_NUM_THREADS="1", OMP_NUM_THREADS="1", MKL_NUM_THREADS="1", NUMEXPR_NUM_THREADS="1")
+            import numpy, pandas, duckdb  # noqa: F401
     except Exception:
         return None
     _SEQ[0] += 1
@@ -906,11 +911,11 @@ def run_once(edits, ids, est, deadline, label):
                 idset = set(ids); bad = set(d["failed"])
                 for c in d["collect"]: bad |= {i for i in idset if i.split("::")[0] == c or not c.endswith(".py")}
                 if not bad: bad = idset - set(d["seen"])              # (after a failure the run stops, so the rest is unseen)
-                res = bad & idset
+                res = (bad & idset, (set(d["seen"]) & idset) - bad)
     except Exception:
         res = None
     cleanup()
-    print(f"{label}: ran {len(ids)} tests, {'no answer' if res is None else str(len(res)) + ' failed'}, cpu {cpu if cpu is None else round(cpu, 2)} s", file=sys.stderr)
+    print(f"{label}: ran {len(ids)} tests, {'no answer' if res is None else str(len(res[0])) + ' failed'}, cpu {cpu if cpu is None else round(cpu, 2)} s", file=sys.stderr)
     return res
 
 
@@ -1138,20 +1143,24 @@ def main():
         except Exception as e:
             print(f"{cid}: replay {type(e).__name__}: {e}", file=sys.stderr)
     broken = set()                 # tests that fail here on the unpatched tree: this container cannot judge them
+    proven = set()                 # tests that have passed here at least once: this container can run them
     for _, cid in sorted(jobs, reverse=True):
         try:
             deadline = t0 + WALL_BUDGET
             heavy, wit, est, _ = witness_plan(cid, broken)
             if not heavy or edits_of.get(cid) is None: continue
             ids = [tid[n] for n in wit]
-            bad = run_once(edits_of[cid], ids, est, deadline, cid)
-            if bad is None: continue                                     # no answer: keep the static selection
+            res = run_once(edits_of[cid], ids, est, deadline, cid)
+            if res is None: continue                                     # no answer: keep the static selection
+            bad, passed = res; proven |= passed
             if bad:
-                # A failure counts only if the same test passes here on the unpatched tree. Otherwise it is this
-                # container's doing: the test keeps its static decision and is not run again.
-                again = run_once(None, sorted(bad), run_estimate([tnum[i] for i in bad], ms, tid), deadline, cid + " (unpatched)")
-                if again is None: continue
-                broken |= again
+                # A failure counts only if the same test can pass in this container: it has passed here before, or
+                # it passes now on the unpatched tree. Otherwise the failure is the container's doing: the test
+                # keeps its static decision and is not run again.
+                if bad & proven: continue                                # a real failure: keep the static selection
+                res = run_once(None, sorted(bad), run_estimate([tnum[i] for i in bad], ms, tid), deadline, cid + " (unpatched)")
+                if res is None: continue
+                again, passed = res; proven |= passed; broken |= again
                 if bad - again: continue                                 # a real failure: keep the static selection
                 ran = set(wit)
                 heavy, wit, _, _ = witness_plan(cid, broken)             # the rule must still hold without the unjudged tests
