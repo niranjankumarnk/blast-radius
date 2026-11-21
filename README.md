@@ -66,9 +66,9 @@ exercise each changed spot that selected the heavy test. This is a bet, not a pr
 the only one that fails.
 
 Two of the test files (`test_optimizer.py`, `test_executor.py`) need pandas, duckdb and worker processes, which
-makes their tests expensive to run here. When running every cheaper selected test would cost too much, the
-selector tries the cheaper selected tests outside those two files instead, under the same rule (all pass, three
-per changed spot). The tests it did not run stay scheduled.
+makes their tests expensive to run here, so the rule is applied only when running every cheaper selected test is
+affordable. A variant that ran just the cheaper selected tests outside those two files (`BR_NONPOOL=1`) is off: on
+labelled generated patches it dropped `test_execute_tpcds` wrongly 2 times in 13.
 
 - A test that fails on the patched tree is re-run on the unpatched tree. If it fails there too, the container
   cannot judge it: it keeps its static decision and is not counted for or against the heavy test.

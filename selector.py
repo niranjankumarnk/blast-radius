@@ -752,6 +752,10 @@ MAX_EST = float(os.environ.get("BR_MAX_EST", "14"))    # a run that goes wrong i
 HEAVY_RATIO = float(os.environ.get("BR_HEAVY_RATIO", "0.6"))
 MIN_WITNESS = int(os.environ.get("BR_WITNESS", "3"))
 KEEP_WITNESSES = os.environ.get("BR_KEEP_WITNESSES", "0") == "1"
+# The second, cheaper witness set (selected tests outside test_optimizer.py / test_executor.py) is off: on labelled
+# generated patches it dropped test_execute_tpcds wrongly 2 times in 13 (optimizer changes that only a TPC-DS query
+# shows, with four passing witnesses each).
+NONPOOL = os.environ.get("BR_NONPOOL", "0") == "1"
 WALL_BUDGET = float(os.environ.get("BR_WALL", "110"))
 TMP = os.environ.get("BR_TMP", "/tmp")
 POOL_FILES = ("tests/test_optimizer.py", "tests/test_executor.py")
@@ -1080,7 +1084,8 @@ def main():
         nums = chosen[cid]
         heavy = [n for n in nums if ms[n] >= HEAVY_MS]
         cheaper = [n for n in nums if ms[n] < HEAVY_MS and tid[n].split("::")[0] not in s.resolvers() and tid[n] not in broken]
-        for wit in (cheaper, [n for n in cheaper if tid[n].split("::")[0] not in POOL_FILES]) if heavy else ():
+        sets = (cheaper, [n for n in cheaper if tid[n].split("::")[0] not in POOL_FILES]) if NONPOOL else (cheaper,)
+        for wit in sets if heavy else ():
             wb = sum(1 << inv[n] for n in wit)
             if not wit or not all(bin(p & wb).count("1") >= MIN_WITNESS for p in parts[cid] if any(p >> inv[h] & 1 for h in heavy)): continue
             est = run_estimate(wit, ms, tid)
