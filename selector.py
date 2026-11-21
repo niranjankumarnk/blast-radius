@@ -1067,6 +1067,9 @@ def run_units(edits, obj, units, est, deadline, label):
 # cannot be loaded or is not reached stays scheduled, so a failure caused by the container costs time, never a miss.
 INPROC = os.environ.get("BR_INPROC", "1") == "1"
 INPROC_RATIO = float(os.environ.get("BR_INPROC_RATIO", "0.6"))
+INPROC_POOL = os.environ.get("BR_INPROC_POOL", "0") == "1"       # also run tests of test_optimizer.py / test_executor.py (off: it costs more CPU than it saves)
+INPROC_OPT = [float(x) for x in os.environ.get("BR_INPROC_OPT", "0.6,1.8").split(",")]       # set-up seconds, CPU per recorded second
+INPROC_EXE = [float(x) for x in os.environ.get("BR_INPROC_EXE", "4.0,3.0").split(",")]
 
 
 def _inproc_child(root, ids, out, tmpd, limit):
@@ -1086,9 +1089,13 @@ def _inproc_child(root, ids, out, tmpd, limit):
         os.environ.update(PYTHONPATH=root, SKIP_INTEGRATION="0", PYTHONDONTWRITEBYTECODE="1", PYTHON_CPU_COUNT="1")
         sys.dont_write_bytecode = True
         signal.alarm(int(limit))                                         # a patched loop that never ends stops here
+        pooled = any(i.split("::")[0] in POOL_FILES for i in ids)
         passed, cases = [], {}
         suite = unittest.TestSuite()
+        ids = sorted(ids, key=lambda i: (i.split("::")[0] not in POOL_FILES, i.split("::")[:2]))
+        zyg = None
         for i in ids:
+            if zyg is None and pooled and i.split("::")[0] not in POOL_FILES: zyg = _pool_stand_in()
             try:
                 path, cls, meth = i.split("::")
                 case = getattr(importlib.import_module(path[:-3].replace("/", ".")), cls)(meth)
@@ -1096,6 +1103,7 @@ def _inproc_child(root, ids, out, tmpd, limit):
                 cases[id(case)] = i; suite.addTest(case)
             except BaseException:
                 continue                                                 # not loadable here: stays scheduled
+        if zyg is None and pooled: zyg = _pool_stand_in()
 
         class Result(unittest.TestResult):
             def __init__(self):
@@ -1117,13 +1125,151 @@ def _inproc_child(root, ids, out, tmpd, limit):
         passed = sorted(i for i in res.ok - res.bad if i) if clean else []
         with open(out + ".tmp", "w") as fh: json.dump({"passed": passed}, fh)
         os.rename(out + ".tmp", out)
+        if zyg is not None:
+            os.close(zyg[1]); os.waitpid(zyg[0], 0)                      # (so that its CPU time is counted with this run's)
     finally:
         os._exit(0)
+
+
+def _pool_stand_in():
+    """Replace concurrent.futures.ProcessPoolExecutor, for the test modules imported so far, by a pool of one worker
+    that is forked instead of spawned.
+
+    The optimizer and executor tests hand their work to a ProcessPoolExecutor of spawned workers, and starting those
+    costs more CPU than the tests themselves. The stand-in keeps what a worker process means for a test's outcome:
+    a task runs in another process, which has imported the test modules and run none of their tests; its
+    arguments and its result cross a pipe as pickles; mocks and state set up by the test are not visible to it;
+    and what a task leaves behind stays in the worker for the next task. This process forks a template now, before
+    any test runs and before any thread exists, and the template forks one worker for each pool a test opens.
+    One worker per pool is what the real pool has on a one-CPU machine. Anything this stand-in cannot do the way
+    the real pool does (a second pool open at the same time, a dead worker) fails the test, which keeps it scheduled.
+    -> (pid of the template, descriptor to close when the tests are done)"""
+    import concurrent.futures as cf, pickle, struct
+    from concurrent.futures.process import BrokenProcessPool
+
+    def send(fd, obj):
+        data = pickle.dumps(obj, pickle.HIGHEST_PROTOCOL); data = struct.pack("<Q", len(data)) + data
+        while data: data = data[os.write(fd, data):]
+
+    def recv(fd):
+        def take(n):
+            buf = b""
+            while len(buf) < n:
+                part = os.read(fd, min(n - len(buf), 1 << 20))
+                if not part: raise EOFError
+                buf += part
+            return buf
+        return pickle.loads(take(struct.unpack("<Q", take(8))[0]))
+
+    def packed(kind, value):
+        try:
+            return (kind, pickle.dumps(value, pickle.HIGHEST_PROTOCOL))
+        except BaseException as e:
+            return ("err", pickle.dumps(RuntimeError(f"unpicklable {kind}: {e!r}")))
+
+    def serve(rd, wr, init):
+        broken = None
+        try:
+            initializer, initargs = pickle.loads(init)
+            if initializer is not None: initializer(*initargs)
+        except BaseException as e:
+            broken = repr(e)
+        while True:
+            msg = recv(rd)
+            if msg[0] != "task": return
+            if broken is not None:
+                send(wr, ("broken", broken)); continue
+            try:
+                fn, a, k = pickle.loads(msg[1]); reply = packed("ok", fn(*a, **k))
+            except BaseException as e:
+                reply = packed("err", e)
+            send(wr, reply)
+
+    to_r, to_w = os.pipe(); back_r, back_w = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        try:
+            signal.alarm(0); os.close(to_w); os.close(back_r)
+            while True:
+                msg = recv(to_r)
+                if msg[0] != "new": continue
+                w = os.fork()
+                if w == 0:
+                    try: serve(to_r, back_w, msg[1])
+                    finally: os._exit(0)
+                os.waitpid(w, 0)
+        finally:
+            os._exit(0)
+    os.close(to_r); os.close(back_w)
+    state = {"open": None}
+
+    class Pool:
+        def __init__(self, *a, initializer=None, initargs=(), **k):
+            self.dead = None; self.closed = True
+            if state["open"] is not None: raise RuntimeError("a second process pool at the same time is not supported here")
+            send(to_w, ("new", pickle.dumps((initializer, initargs), pickle.HIGHEST_PROTOCOL)))
+            state["open"] = self; self.closed = False
+
+        def submit(self, fn, /, *a, **k):
+            if self.closed: raise RuntimeError("cannot schedule new futures after shutdown")
+            if self.dead is not None: raise BrokenProcessPool(self.dead)
+            f = cf.Future(); f.set_running_or_notify_cancel()
+            try:
+                task = pickle.dumps((fn, a, k), pickle.HIGHEST_PROTOCOL)
+            except BaseException as e:
+                f.set_exception(e); return f
+            try:
+                send(to_w, ("task", task)); kind, data = recv(back_r)
+            except (EOFError, OSError):
+                kind, data = "broken", "the worker process ended"
+            if kind == "broken":
+                self.dead = data; f.set_exception(BrokenProcessPool(data))
+            elif kind == "ok":
+                f.set_result(pickle.loads(data))
+            else:
+                f.set_exception(pickle.loads(data))
+            return f
+
+        def shutdown(self, *a, **k):
+            if self.closed: return
+            self.closed = True; state["open"] = None
+            try: send(to_w, ("close",))
+            except OSError: pass
+
+        def __enter__(self): return self
+
+        def __exit__(self, *exc): self.shutdown(); return False
+
+    cf.ProcessPoolExecutor = Pool
+    for f in POOL_FILES:
+        mod = sys.modules.get(f[:-3].replace("/", "."))
+        if mod is not None and hasattr(mod, "ProcessPoolExecutor"): mod.ProcessPoolExecutor = Pool
+    return pid, to_w
+
+
+def numeric_ready():
+    """Import pandas, duckdb and numpy once in this process, single-threaded, so that forked runs inherit them.
+    False if that leaves a thread alive here (a fork would not carry it) or the import fails."""
+    if _NUMERIC: return _NUMERIC[0]
+    ok = False
+    try:
+        os.environ.update(OPENBLAS_NUM_THREADS="1", OMP_NUM_THREADS="1", MKL_NUM_THREADS="1", NUMEXPR_NUM_THREADS="1")
+        import threading, numpy, pandas, duckdb  # noqa: F401
+        ok = threading.active_count() == 1
+        if ok and os.path.exists("/proc/self/task"): ok = len(os.listdir("/proc/self/task")) == 1
+    except Exception:
+        ok = False
+    _NUMERIC.append(ok)
+    return ok
+
+
+_NUMERIC = []
 
 
 def run_inproc(edits, ids, est, deadline, label):
     """-> the ids that passed on the patched tree, or None when the run gave no answer."""
     if time.time() >= deadline: return None
+    if any(i.split("::")[0] in POOL_FILES for i in ids) and not numeric_ready(): return None
     _SEQ[0] += 1
     base = os.path.join(TMP, f"br-{os.getpid()}-{_SEQ[0]}"); out = base + ".json"; tmpd = base + ".tmp"
     def cleanup():
@@ -1273,9 +1419,16 @@ def main():
         try:
             if cid not in texts: continue
             if not any((p or "").endswith(".py") for f in parse_patch(texts[cid]) for p in f[:2]): continue
-            run = [n for n in nums if ms[n] < HEAVY_MS and tid[n].split("::")[0] not in POOL_FILES and tid[n].split("::")[0] not in s.resolvers() and tid[n].count("::") == 2]
+            run = [n for n in nums if ms[n] < HEAVY_MS and (INPROC_POOL or tid[n].split("::")[0] not in POOL_FILES) and tid[n].split("::")[0] not in s.resolvers() and tid[n].count("::") == 2]
             if not run: continue
-            est = 0.25 + 0.6 * sum(ms[n] for n in run) / 1000            # (measured: 0.16-0.64 s for 1-6 tests under emulation)
+            files = {tid[n].split("::")[0] for n in run}
+            t_opt = sum(ms[n] for n in run if tid[n].split("::")[0] == POOL_FILES[0]) / 1000
+            t_exe = sum(ms[n] for n in run if tid[n].split("::")[0] == POOL_FILES[1]) / 1000
+            # (measured under emulation: 0.16-0.64 s for 1-6 plain tests. Optimizer tests: 0.55-0.65 s for one tiny test,
+            # 18.2 s for the 145 that use no pool (11.7 s recorded), 15.5 s for the 22 that do (8.1 s recorded).
+            # Executor tests: 4-5.5 s before the first test runs, 9.9 s for the 56 small ones (1.35 s recorded).)
+            est = (0.25 + 0.6 * (sum(ms[n] for n in run) / 1000 - t_opt - t_exe)
+                   + (INPROC_OPT[0] + INPROC_OPT[1] * t_opt if t_opt else 0) + (INPROC_EXE[0] + INPROC_EXE[1] * t_exe if t_exe else 0))
             gain = (pack_cost(nums, ms) - pack_cost([n for n in nums if n not in set(run)], ms)) / 1000
             if est <= INPROC_RATIO * gain: ijobs.append((gain - est, cid, run, est))
         except Exception as e:
