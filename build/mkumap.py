@@ -27,14 +27,38 @@ def sid(b):
     if b not in idx:
         idx[b] = len(sets); sets.append(b.to_bytes(width, "little"))
     return idx[b]
+# UMAP_PHASE=<dir of <unit>.json> with UMAP_SRC=<pinned checkout>: keep, for each unit, only the lines that run in
+# its second phase (for a TPC-DS query: inside PythonExecutor.execute) plus the lines it runs that are import-time
+# code (module and class bodies, def headers), whose effects any later phase can see. The map then answers "can this
+# patch change what the unit's second phase does, given the same inputs?".
+phase_dir, src_dir = os.environ.get("UMAP_PHASE"), os.environ.get("UMAP_SRC")
+phase = [json.load(open(os.path.join(phase_dir, f"{i}.json"))) for i in range(n)] if phase_dir else None
+def import_level(f):
+    import ast
+    text = open(os.path.join(src_dir, f), encoding="utf-8").read(); tree = ast.parse(text)
+    keep = set(range(1, text.count("\n") + 2))
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            keep -= set(range(node.body[0].lineno if not getattr(node.body[0], "decorator_list", None) else min(d.lineno for d in node.body[0].decorator_list), node.end_lineno + 1))
+    return keep
 files = {}; added = 0
 for f in set(m["files"]) | set(q["files"]):
     lines = {}
     if f in q["files"]:
         for l, i in zip(*q["files"][f]): lines[l] = qb(i)
+    harness_lines = set()
     if f in m["files"]:
         for l, i in zip(*m["files"][f]):
-            if mb(i) >> real & 1 and not lines.get(l): lines[l] = hbit; added += 1
+            if mb(i) >> real & 1 and not lines.get(l): lines[l] = hbit; added += 1; harness_lines.add(l)
+    if phase is not None and f.endswith(".py"):
+        imp = import_level(f); second = [set(p.get(f, ())) for p in phase]
+        for l in list(lines):
+            if l in harness_lines or l in imp: continue
+            b = 0
+            for u in range(n):
+                if lines[l] >> u & 1 and l in second[u]: b |= 1 << u
+            if b: lines[l] = b
+            else: del lines[l]
     if lines:
         ks = sorted(lines); files[f] = (ks, [sid(lines[k]) for k in ks])
 reads = {k: qb(i) for k, i in q["reads"].items()}

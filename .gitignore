@@ -29,3 +29,5 @@ gm_expected.json
 tpcds_expected.json
 build/g/expected.native.json
 build/q/expected.native.json
+build/q/phase/
+gen/phase_lines.json
