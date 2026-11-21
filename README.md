@@ -62,6 +62,14 @@ not, or the patch touches what only the real test executes, the test stays. This
 executes no changed code. A unit that differs is re-run on the unpatched tree; if it differs there too, the
 container cannot replay it and the mechanism turns itself off. `BR_EXACT=0` turns it off.
 
+## Cheap selections, verified in-process
+
+Most of what the static selection still over-schedules is patches that break nothing. For a selection without
+heavy tests, the selected tests outside `test_optimizer.py` and `test_executor.py` are run in a forked child that
+imports the patched tree fresh and runs the test methods with unittest, without starting pytest. Tests that pass
+are not scheduled; a test that fails, errors, cannot be loaded or is not reached stays scheduled, so a failure
+caused by the container costs time, never a miss. `BR_INPROC=0` turns it off.
+
 ## Heavy tests, by witnesses
 
 Three tests take 6 to 29 seconds each, so one of them decides the cost of any commit that selects it. When a

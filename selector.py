@@ -1059,6 +1059,111 @@ def run_units(edits, obj, units, est, deadline, label):
     return res
 
 
+# ---- verifying a cheap selection by running it in-process -----------------------------------------------------
+# Most of what the static selection still over-schedules is patches that break nothing. For a selection without
+# heavy tests, the selected tests outside the two pandas/duckdb test files are run in a forked child: it imports
+# the patched tree fresh (the parent never imports sqlglot, so nothing stale survives the fork) and runs the test
+# methods with unittest, without starting pytest. Tests that pass are not scheduled. A test that fails, errors,
+# cannot be loaded or is not reached stays scheduled, so a failure caused by the container costs time, never a miss.
+INPROC = os.environ.get("BR_INPROC", "1") == "1"
+INPROC_RATIO = float(os.environ.get("BR_INPROC_RATIO", "0.5"))
+
+
+def _inproc_child(root, ids, out, tmpd, limit):
+    try:
+        os.setsid()
+        nul = os.open(os.devnull, os.O_RDWR)
+        for fd in (0, 1, 2): os.dup2(nul, fd)
+        os.chdir(root)
+        try:
+            with open("/proc/self/oom_score_adj", "w") as fh: fh.write("1000")
+        except OSError:
+            pass
+        import importlib, tempfile, unittest
+        os.environ["TMPDIR"] = tmpd; tempfile.tempdir = None
+        here = os.path.dirname(os.path.abspath(__file__))
+        sys.path[:] = [root] + [p for p in sys.path if p not in ("", here, str(SRC), root)]
+        os.environ.update(PYTHONPATH=root, SKIP_INTEGRATION="0", PYTHONDONTWRITEBYTECODE="1", PYTHON_CPU_COUNT="1")
+        sys.dont_write_bytecode = True
+        signal.alarm(int(limit))                                         # a patched loop that never ends stops here
+        passed, cases = [], {}
+        suite = unittest.TestSuite()
+        for i in ids:
+            try:
+                path, cls, meth = i.split("::")
+                case = getattr(importlib.import_module(path[:-3].replace("/", ".")), cls)(meth)
+                if not isinstance(case, unittest.TestCase): continue
+                cases[id(case)] = i; suite.addTest(case)
+            except BaseException:
+                continue                                                 # not loadable here: stays scheduled
+
+        class Result(unittest.TestResult):
+            def __init__(self):
+                super().__init__(); self.bad = set(); self.ok = set()
+            def _mark(self, test):
+                self.bad.add(cases.get(id(getattr(test, "test_case", test))))
+            def addError(self, test, err): super().addError(test, err); self._mark(test)
+            def addFailure(self, test, err): super().addFailure(test, err); self._mark(test)
+            def addUnexpectedSuccess(self, test): super().addUnexpectedSuccess(test); self._mark(test)
+            def addSubTest(self, test, subtest, err):
+                super().addSubTest(test, subtest, err)
+                if err is not None: self._mark(test)
+            def addSuccess(self, test): super().addSuccess(test); self.ok.add(cases.get(id(test)))
+            def addSkip(self, test, reason): super().addSkip(test, reason); self.ok.add(cases.get(id(test)))
+            def addExpectedFailure(self, test, err): super().addExpectedFailure(test, err); self.ok.add(cases.get(id(test)))
+        res = Result(); suite.run(res)
+        signal.alarm(0)
+        clean = not res.errors or all(cases.get(id(getattr(t, "test_case", t))) for t, _ in res.errors)      # (a class or module set-up error names no test)
+        passed = sorted(i for i in res.ok - res.bad if i) if clean else []
+        with open(out + ".tmp", "w") as fh: json.dump({"passed": passed}, fh)
+        os.rename(out + ".tmp", out)
+    finally:
+        os._exit(0)
+
+
+def run_inproc(edits, ids, est, deadline, label):
+    """-> the ids that passed on the patched tree, or None when the run gave no answer."""
+    if time.time() >= deadline: return None
+    _SEQ[0] += 1
+    base = os.path.join(TMP, f"br-{os.getpid()}-{_SEQ[0]}"); out = base + ".json"; tmpd = base + ".tmp"
+    def cleanup():
+        shutil.rmtree(base, ignore_errors=True); shutil.rmtree(tmpd, ignore_errors=True)
+        try: os.remove(out)
+        except OSError: pass
+    limit = max(6, est * 3 + 4)
+    try:
+        shutil.rmtree(base, ignore_errors=True); build_overlay(base, edits); os.makedirs(tmpd, exist_ok=True)
+        sys.stdout.flush(); sys.stderr.flush()
+        pid = os.fork()
+    except Exception:
+        cleanup(); return None
+    if pid == 0: _inproc_child(base, ids, out, tmpd, limit)
+    end = time.time() + limit + 2; status = cpu = None
+    while True:
+        try:
+            p, st, ru = os.wait4(pid, os.WNOHANG)
+        except ChildProcessError:
+            break
+        if p == pid:
+            status, cpu = st, ru.ru_utime + ru.ru_stime; break
+        if time.time() > end: break
+        time.sleep(0.005)
+    try: os.killpg(pid, signal.SIGKILL)
+    except OSError: pass
+    try:
+        while os.waitpid(-1, 0 if status is None else os.WNOHANG)[0] > 0 and status is not None: pass
+    except ChildProcessError:
+        pass
+    res = None
+    try:
+        if status is not None and os.WIFEXITED(status) and os.path.exists(out): res = set(json.load(open(out))["passed"]) & set(ids)
+    except Exception:
+        res = None
+    cleanup()
+    print(f"{label}: ran {len(ids)} tests in-process, {'no answer' if res is None else str(len(res)) + ' passed'}, cpu {cpu if cpu is None else round(cpu, 2)} s", file=sys.stderr)
+    return res
+
+
 def pack_cost(numbers, ms):
     if not numbers: return 0
     ws = pack(numbers, ms)
@@ -1162,6 +1267,27 @@ def main():
                 obj.ok = False               # the unit differs here even without the patch: this container cannot replay it
         except Exception as e:
             print(f"{cid}: replay {type(e).__name__}: {e}", file=sys.stderr)
+    # Cheap selections: run what can be run in-process and schedule only what did not pass.
+    ijobs = []
+    for cid, nums in chosen.items() if INPROC and not s.remap else ():
+        try:
+            if cid not in texts or any(ms[n] >= HEAVY_MS for n in nums): continue
+            if not any((p or "").endswith(".py") for f in parse_patch(texts[cid]) for p in f[:2]): continue
+            run = [n for n in nums if tid[n].split("::")[0] not in POOL_FILES and tid[n].split("::")[0] not in s.resolvers() and tid[n].count("::") == 2]
+            if not run: continue
+            est = 0.5 + 1.2 * sum(ms[n] for n in run) / 1000
+            gain = (pack_cost(nums, ms) - pack_cost([n for n in nums if n not in set(run)], ms)) / 1000
+            if est <= INPROC_RATIO * gain: ijobs.append((gain - est, cid, run, est))
+        except Exception as e:
+            print(f"{cid}: in-process plan {type(e).__name__}: {e}", file=sys.stderr)
+    for _, cid, run, est in sorted(ijobs, key=lambda j: -j[0]):
+        try:
+            if cid not in edits_of: edits_of[cid] = patch_edits(parse_patch(texts[cid]))
+            if edits_of[cid] is None: continue
+            passed = run_inproc(edits_of[cid], [tid[n] for n in run], est, t0 + WALL_BUDGET, cid)
+            if passed: chosen[cid] = [n for n in chosen[cid] if tid[n] not in passed]
+        except Exception as e:
+            print(f"{cid}: in-process {type(e).__name__}: {e}", file=sys.stderr)
     broken = set()                 # tests that fail here on the unpatched tree: this container cannot judge them
     proven = set()                 # tests that have passed here at least once: this container can run them
     for _, cid in sorted(jobs, reverse=True):
