@@ -968,7 +968,8 @@ class Units:
 
     def estimate(self, units):
         """units: [(unit, True to run it in full / False to compare only what its data phase is given)]"""
-        load = sum(self.exp["load"].get(t, 0) for t in {t for u, _ in units for t in self.exp["tables"][u]}) if self.kind == "tpcds" else 0
+        # (tables are read from csv only when some query is executed; otherwise they come from the build's pickles)
+        load = sum(self.exp["load"].get(t, 0) for t in {t for u, _ in units for t in self.exp["tables"][u]}) if self.kind == "tpcds" and any(f for _, f in units) else 0
         return 0.6 + 1.2 * (sum(self.cost(i) for i in units) + load)
 
 
