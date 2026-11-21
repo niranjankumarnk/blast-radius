@@ -21,6 +21,20 @@ for t in tests:
         reads[r] = reads.get(r, 0) | bit
     if d["subproc"]:
         subproc |= bit
+# Lines a test reaches only when the whole suite runs in one process (state left by earlier tests): build/suite.json,
+# written by build/suitecov.py, is {"lines": {file: {line: [test ids]}}}. Union them in.
+suite = os.path.join(HERE, "suite.json"); suite_pairs = 0
+if os.path.exists(suite):
+    num = {t["id"]: t["number"] for t in tests}
+    for f, lm in json.load(open(suite))["lines"].items():
+        m = lines.setdefault(f, {})
+        for l, ctx in lm.items():
+            b = 0
+            for c in ctx:
+                if c in num: b |= 1 << num[c]
+            extra = b & ~m.get(int(l), 0)
+            if extra: m[int(l)] = m.get(int(l), 0) | b; suite_pairs += bin(extra).count("1")
+print("suite-only (line, test) pairs added", suite_pairs, file=sys.stderr)
 fn, inst, fn_missing = {}, {}, 0   # file -> {firstlineno: bitset}; "module:Class" -> bitset
 for t in tests:
     p = os.path.join(HERE, "fn", f"{t['number']}.json")

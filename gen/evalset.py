@@ -28,8 +28,41 @@ for line in p.stdout.decode().splitlines():
         best = min(max(sum(sorted((ms[n] for n in a), reverse=True)[i::k]) for i in range(k)) + 2000 * k for k in range(1, 9))
     tot += cost + (300000 if m else 0); miss += bool(m); ideal += best
     rows.append((c, kinds.get(c, ""), len(a), len(sel), cost / 1000, best / 1000, m, c in log))
+def confirm(c, m):
+    """Re-run the files of the missed tests on the patched tree, twice: a miss counts only if a missed test fails again."""
+    src = os.path.join(here, "sqlglot-src"); w = os.path.join(os.environ.get("EV_WORK", "/private/tmp"), "brconfirm-" + c)
+    subprocess.run(["git", "-C", src, "worktree", "add", "--detach", "-f", w, "HEAD"], capture_output=True)
+    try:
+        if subprocess.run(["git", "-C", w, "apply", "--whitespace=nowarn", os.path.join(sd, c + ".patch")], capture_output=True).returncode: return None
+        files = sorted({tests[n]["file"] for n in m}); again = set()
+        for _ in range(2):
+            res = os.path.join(w, ".outcome.json")
+            e = dict(os.environ, SKIP_INTEGRATION="0", OUTCOME_OUT=res, PYTHONPATH=w + ":" + os.path.join(here, "gen"), PYTHONDONTWRITEBYTECODE="1", PYTHON_CPU_COUNT="2",
+                     PATH=os.path.join(here, ".venv/bin") + ":" + os.environ["PATH"])
+            if os.path.exists(res): os.remove(res)
+            subprocess.run([os.path.join(here, ".venv/bin/python"), "-m", "pytest", "-p", "outcome_plugin", "-q", "-p", "no:cacheprovider", "--timeout", "900",
+                            "--deselect", "tests/test_parser.py::TestParser::test_max_nodes", "--deselect", "tests/test_executor.py::TestExecutor::test_execute_tpcds"] + files,
+                           cwd=w, env=e, capture_output=True)
+            if not os.path.exists(res): return None
+            o = json.load(open(res)); bad = set(o["failed"])
+            for ce in o["collect_errors"]: bad |= {t["id"] for t in tests if t["file"] == ce}
+            again |= {n for n in m if tests[n]["id"] in bad}
+        return sorted(again)
+    finally:
+        subprocess.run(["git", "-C", src, "worktree", "remove", "--force", w], capture_output=True)
+
+
+real = 0
+for c, k, na, ns, cost, best, m, ran in rows:
+    if m and "CONFIRM" in os.environ:
+        heavy = [n for n in m if tests[n]["seconds"] >= 20]
+        again = confirm(c, [n for n in m if n not in heavy])
+        verdict = "unconfirmed (could not re-run)" if again is None else ("CONFIRMED " + str([tests[n]["id"].split("::")[-1] for n in again[:4]]) if again else "not reproduced: flaky label") + (" [heavy test not re-run]" if heavy else "")
+        real += bool(again or again is None or heavy)
+        print(f"  {c}: {verdict}")
 for c, k, na, ns, cost, best, m, ran in rows:
     if m: print(f"MISS {c} {k[:60]:60} fail={na} sel={ns} ran={ran} missed={[tests[n]['id'].split('::')[-1] for n in m[:3]]}{'...' if len(m) > 3 else ''}")
 if "-v" in os.environ.get("EV", ""):
     for c, k, na, ns, cost, best, m, ran in rows: print(f"{c} {k[:50]:50} fail={na:4} sel={ns:4} cost={cost:6.1f} ideal={best:6.1f} {'ran' if ran else ''}")
+if "CONFIRM" in os.environ: print(f"misses reproduced or unverifiable: {real} of {miss}")
 print(f"{len(rows)} commits  simulated {tot/1000:.1f}s  misses {miss}  cpu {cpu:.1f}s  ideal {ideal/1000:.1f}s  nonmiss-sim {(tot-300000*miss)/1000:.1f}  ran {sum(r[7] for r in rows)}")

@@ -2,6 +2,7 @@
 sqlglot-src/
 build/iso/
 build/raw.json
+build/suite.json
 build/__pycache__/
 __pycache__/
 output.jsonl

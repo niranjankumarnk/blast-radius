@@ -28,7 +28,8 @@ def superset(text):
     b = sel.subproc
     for f in S.parse_patch(text):
         for p in {f[0], f[1]} - {None}:
-            if not (p.startswith("sqlglot/") and p.endswith(".py")) or p.endswith("__init__.py"): return None
+            if p.endswith(("__init__.py", "conftest.py")) or f[0] != f[1] or not p.startswith(("sqlglot/", "tests/")): return None
+            if p.endswith(".py") and p not in sel.files and p not in sel.by_file: return None
             b |= sel.file_tests(p) | sel.readers(p, True) | sel.by_file.get(p, 0)
     return [i for i in range(b.bit_length()) if b >> i & 1]
 
@@ -52,9 +53,22 @@ def run(cid):
                            cwd=d, env=env, capture_output=True, text=True, timeout=1200)
         except subprocess.TimeoutExpired:
             json.dump({"applied": True, "fast": True, "hang": True, "failing": nums}, open(out, "w")); return "hang"
-        if not os.path.exists(res):
-            json.dump({"applied": True, "fast": True, "crash": True, "failing": nums}, open(out, "w")); return "crash"
-        o = json.load(open(res)); failing = {num[i] for i in o["failed"] if i in num}
+        o = json.load(open(res)) if os.path.exists(res) else None
+        if o is None or o["seen"] < len(ids):
+            # pytest ran nothing or not everything (a test id that no longer exists stops the whole invocation):
+            # run the files that hold the superset instead, and keep the verdicts of the superset's tests.
+            if os.path.exists(res): os.remove(res)
+            files = sorted({i.split("::")[0] for i in ids if os.path.exists(os.path.join(d, i.split("::")[0]))})
+            try:
+                subprocess.run([PY, "-m", "pytest", "-p", "outcome_plugin", "-q", "-p", "no:cacheprovider", "--timeout", "300",
+                                "--deselect", "tests/test_parser.py::TestParser::test_max_nodes", "--deselect", "tests/test_executor.py::TestExecutor::test_execute_tpcds"] + files,
+                               cwd=d, env=env, capture_output=True, text=True, timeout=2400)
+            except subprocess.TimeoutExpired:
+                return "hang2"
+            if not os.path.exists(res): return "norun"                 # no label: the outcome is unknown
+            o = json.load(open(res))
+            if any(secs[n] >= 20 for n in nums): return "heavy-unknown"   # (the two slowest tests were not run)
+        failing = {num[i] for i in o["failed"] if i in num and num[i] in set(nums)}
         for c in o["collect_errors"]: failing.update(n for n in by_file.get(c, []) if n in set(nums))
         json.dump({"applied": True, "fast": True, "failing": sorted(failing), "superset": len(nums), "collect_errors": o["collect_errors"], "seen": o["seen"]}, open(out + ".tmp", "w"))
         os.rename(out + ".tmp", out); return "ok"

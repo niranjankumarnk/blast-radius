@@ -59,6 +59,10 @@ def run(cid):
 
 
 ids = sorted(f[:-6] for f in os.listdir(PD) if f.endswith(".patch"))
+if os.environ.get("LABEL_FIRST") and os.path.exists(os.path.join(PD, "kinds.json")):      # label these kinds first
+    kinds = json.load(open(os.path.join(PD, "kinds.json"))); first = tuple(os.environ["LABEL_FIRST"].split(","))
+    ids.sort(key=lambda c: (not kinds.get(c, "").startswith(first), c))
+    if os.environ.get("LABEL_ONLY"): ids = [c for c in ids if kinds.get(c, "").startswith(first)]
 STATIC.update(static_selection())
 print("static selections", len(STATIC), flush=True)
 with ThreadPoolExecutor(JOBS) as ex: list(ex.map(run, ids))
