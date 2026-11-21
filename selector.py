@@ -845,7 +845,8 @@ def _child(root, ids, out, tmpd, per_test_timeout):
         sys.dont_write_bytecode = True
         import pytest
         rec = _Recorder()
-        code = pytest.main(["-q", "-p", "no:cacheprovider", "--timeout", str(per_test_timeout), *ids], plugins=[rec])
+        # -x: one failure already decides (the static selection is kept), so stop there
+        code = pytest.main(["-q", "-x", "-p", "no:cacheprovider", "--timeout", str(per_test_timeout), *ids], plugins=[rec])
         with open(out + ".tmp", "w") as fh:
             json.dump({"code": int(code), "failed": sorted(rec.failed), "seen": sorted(rec.seen), "collect": rec.collect}, fh)
         os.rename(out + ".tmp", out)
@@ -879,8 +880,8 @@ def run_once(edits, ids, est, deadline, label):
         pid = os.fork()
     except Exception:
         cleanup(); return None
-    if pid == 0: _child(root, ids, out, tmpd, int(max(20, est * 4)))
-    limit = time.time() + max(20, est * 3 + 10); status = cpu = None
+    if pid == 0: _child(root, ids, out, tmpd, int(max(5, est * 2)))
+    limit = time.time() + max(8, est * 2.5 + 4); status = cpu = None      # a patched loop that never ends is cut off here
     while True:
         try:
             p, st, ru = os.wait4(pid, os.WNOHANG)
@@ -901,8 +902,9 @@ def run_once(edits, ids, est, deadline, label):
         if status is not None and os.WIFEXITED(status) and os.path.exists(out):
             d = json.load(open(out))
             if d["code"] in (0, 1):
-                idset = set(ids); bad = set(d["failed"]) | (idset - set(d["seen"]))
+                idset = set(ids); bad = set(d["failed"])
                 for c in d["collect"]: bad |= {i for i in idset if i.split("::")[0] == c or not c.endswith(".py")}
+                if not bad: bad = idset - set(d["seen"])              # (after a failure the run stops, so the rest is unseen)
                 res = bad & idset
     except Exception:
         res = None
