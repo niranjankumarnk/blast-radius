@@ -6,7 +6,7 @@ DATA = Path(os.environ.get("BR_DATA", "/data"))
 SRC = Path(os.environ.get("BR_SRC", "/opt/sqlglot"))
 MAP = Path(os.environ.get("BR_MAP", Path(__file__).with_name("map.bin")))
 WORKER_MS, MAX_WORKERS = 2000, 8
-ALL_TRIGGERS = ("conftest.py", "pytest.ini", "pyproject.toml", "setup.cfg", "tox.ini", "setup.py")
+ALL_TRIGGERS = ("conftest.py", "pytest.ini", ".pytest.ini", "sitecustomize.py", "usercustomize.py")
 HUNK = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 
 
@@ -19,8 +19,11 @@ def parse_patch(text):
             m = re.match(r"diff --git a/(.*) b/(.*)$", l)
             cur = [m.group(1), m.group(2), []] if m else [None, None, []]
             files.append(cur)
-        elif cur is not None and l.startswith("--- ") and i + 1 < len(lines) and lines[i + 1].startswith("+++ "):
-            a, b = l[4:].split("\t")[0], lines[i + 1][4:].split("\t")[0]
+        elif l.startswith("--- ") and i + 1 < len(lines) and lines[i + 1].startswith("+++ "):
+            if cur is None or cur[2] or cur.count("---"):          # a plain unified diff, with no "diff --git" line
+                cur = [None, None, []]; files.append(cur)
+            cur.append("---")
+            a, b = l[4:].split("\t")[0].strip().strip('"'), lines[i + 1][4:].split("\t")[0].strip().strip('"')
             cur[0] = None if a == "/dev/null" else a[2:] if a[:2] in ("a/", "b/") else a
             cur[1] = None if b == "/dev/null" else b[2:] if b[:2] in ("a/", "b/") else b
             i += 1
@@ -92,6 +95,28 @@ class Index:
         return best
 
 
+def strip_docstrings(tree):
+    for n in ast.walk(tree):
+        if isinstance(n, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)) and n.body:
+            b = n.body[0]
+            if isinstance(b, ast.Expr) and isinstance(b.value, ast.Constant) and isinstance(b.value.value, str): b.value.value = ""
+    return ast.dump(tree)
+
+
+def bound_defs(tree):
+    """Qualified names of the functions and classes defined at module and class level."""
+    out = set()
+    def walk(body, prefix):
+        for n in body:
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                out.add(prefix + n.name)
+                if isinstance(n, ast.ClassDef): walk(n.body, prefix + n.name + ".")
+            for f in ("body", "orelse", "finalbody"):
+                if not isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)): walk(getattr(n, f, []) or [], prefix)
+    walk(tree.body, "")
+    return out
+
+
 FUNC = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
 _STUB = ast.Constant(value="<body>")
 
@@ -131,7 +156,7 @@ class Selector:
         m = pickle.loads(zlib.decompress(MAP.read_bytes()))
         self.sets, self.files, self.reads, self.subproc = m["sets"], m["files"], m["reads"], m["subproc"]
         self.fn, self.inst, self.fn_missing = m.get("fn", {}), m.get("inst", {}), m.get("fn_missing", 0)
-        self._src = None
+        self._src = None; self._tsrc = None; self._docs = None; self._res = None
         num = {t["id"]: t["number"] for t in tests}
         self.remap = None if [num.get(i) for i in m["ids"]] == list(range(len(m["ids"]))) and len(num) == len(m["ids"]) else [num.get(i) for i in m["ids"]]
         self.unknown = [t["number"] for t in tests if t["id"] not in set(m["ids"])] if self.remap else []
@@ -139,6 +164,10 @@ class Selector:
         self.by_file = {}
         for i, tid in enumerate(m["ids"]):
             self.by_file[tid.split("::")[0]] = self.by_file.get(tid.split("::")[0], 0) | (1 << i)
+        self.test_dirs = set()
+        for f in self.by_file:
+            d = os.path.dirname(f)
+            while d: self.test_dirs.add(d); d = os.path.dirname(d)
 
     def bits(self, idx): return int.from_bytes(self.sets[idx], "little")
 
@@ -159,13 +188,38 @@ class Selector:
         i = self.fn.get(path, {}).get(line)
         return (self.bits(i) if i is not None else 0) | self.fn_missing
 
-    def name_users(self, name, skip):
-        """Tests that execute any line mentioning `name` (outside `skip` = {(path, line)}); None if nothing mentions it."""
+    def sources(self, tests=False):
         if self._src is None:
             self._src = {str(p.relative_to(SRC)): p.read_text(encoding="utf-8") for p in sorted((SRC / "sqlglot").rglob("*.py"))}
+        if tests and self._tsrc is None:
+            self._tsrc = {}
+            for p in sorted((SRC / "tests").rglob("*.py")):
+                try: self._tsrc[str(p.relative_to(SRC))] = p.read_text(encoding="utf-8")
+                except (OSError, UnicodeDecodeError): pass
+        return {**self._src, **self._tsrc} if tests else self._src
+
+    def gone_name(self, qual, path, idx):
+        """A function or class whose name no longer exists. Callers are found through the body's own coverage; this
+        adds the references that never run the body. A module-level name: every executed line that mentions it, in
+        any file (imports by name included). A method: only code of the same file that runs at import time, because
+        an attribute lookup that reached this definition is already in the body's coverage."""
+        name = qual.split(".")[-1]; method = "." in qual
+        pat = re.compile(r"\b" + re.escape(name) + r"\b"); r = 0
+        for p, text in self.sources(True).items():
+            if name not in text or (method and p != path): continue
+            for i, line in enumerate(text.split("\n"), 1):
+                if not pat.search(line): continue
+                if method:
+                    st = idx.innermost(i)
+                    if st is None or st[4] is not None or isinstance(st[3], FUNC): continue
+                r |= self.cover(p, i, i)
+        return r
+
+    def name_users(self, name, skip):
+        """Tests that execute any line mentioning `name` (outside `skip` = {(path, line)}); None if nothing mentions it."""
         pat = re.compile(r"\b" + re.escape(name) + r"\b"); r = 0; found = False
         define = re.compile(r"\s*" + re.escape(name) + r"\s*(:|=(?!=))")      # a (re)definition in some class body reads nothing
-        for path, text in self._src.items():
+        for path, text in self.sources().items():
             if name not in text: continue
             for i, line in enumerate(text.split("\n"), 1):
                 if (path, i) in skip or not pat.search(line) or line.lstrip().startswith("#"): continue
@@ -206,8 +260,8 @@ class Selector:
         r = self.bits(self.reads[path]) if path in self.reads else 0
         d = os.path.dirname(path) if parents else ""
         while d:                       # tests that list a parent directory see new/removed/renamed files
-            if d in self.reads: r |= self.bits(self.reads[d])
-            d = os.path.dirname(d)
+            if d in self.reads and d not in self.test_dirs: r |= self.bits(self.reads[d])
+            d = os.path.dirname(d)             # (pytest itself lists the directories that hold test files, for every test)
         return r
 
     def select(self, patch_text):
@@ -216,17 +270,63 @@ class Selector:
         if r == self.all: self.parts = [r]
         return r
 
+    def touches_pytest(self, path, hunks):
+        """Does an edit to a root config file change what pytest reads from it?"""
+        try:
+            lines = (SRC / path).read_text(encoding="utf-8").split("\n")
+            if not hunks_fit(lines, hunks): return True
+            new = apply_hunks(lines, hunks)[0]
+        except Exception:
+            return True
+        sect = re.compile(r"^\s*\[(tool[.:]pytest|pytest|tool\.coverage|coverage)", re.M)
+        if sect.search("\n".join(lines)) or sect.search("\n".join(new)): return True
+        return any("pytest" in text.lower() or text.lstrip().startswith("[") for _, body in hunks for tag, text in body if tag != " ")
+
+    def resolvers(self):
+        """Test files that resolve symlinks: they would look past the patched overlay, so their tests are never run here."""
+        if self._res is None:
+            self._res = {p for p, text in self.sources(True).items() if p.startswith("tests/") and any(k in text for k in ("resolve(", "realpath", "readlink", "samefile"))}
+        return self._res
+
+    def reads_docstrings(self):
+        if self._docs is None:
+            self._docs = any(k in text for p, text in self.sources(True).items() if p in self.by_file for k in ("__doc__", "doctest", "getdoc"))
+        return self._docs
+
+    def untraced(self, path):
+        """A file the coverage run could not see (outside sqlglot/ and tests/, or never opened through open()):
+        the tests whose own source mentions its name or its directory."""
+        self.sources(True)
+        keys = {os.path.basename(path)} | {d for d in path.split("/")[:-1] if d not in ("sqlglot", "tests", "fixtures", "")}
+        r = 0
+        for tf, text in self._tsrc.items():
+            if any(k in text for k in keys): r |= self.by_file.get(tf, 0) | self.file_tests(tf)
+        return r
+
     def _select(self, patch_text):
         sel = 0
-        for f in parse_patch(patch_text):
-            old, new, hunks, flags = f[0], f[1], f[2], f[3:]
+        files = parse_patch(patch_text)
+        if not files and patch_text.strip(): return self.all            # not a diff we understand
+        for f in files:
+            old, new, hunks, flags = f[0], f[1], f[2], [x for x in f[3:] if x != "---"]
+            if old is None and new is None:
+                if hunks or flags: return self.all
+                continue
+            if old == new and not hunks and not {"GIT", "Binary", "deleted", "rename"} & set(flags): continue      # mode change only
+            for p in {old, new} - {None}:
+                top = p.split("/")[0]
+                if "/" not in p and p.endswith((".pth", ".cfg", ".ini", ".toml")) and (
+                        old is None or new is None or old != new or not hunks or self.touches_pytest(p, hunks)): return self.all
+                if "/" not in p and p.endswith(".py") and (old is None or new is None or old != new): return self.all   # a root-level module can shadow any import
+                if top not in ("sqlglot", "tests") and p not in self.files and p not in self.reads:
+                    sel |= self.note(self.untraced(p))
             for p in {old, new} - {None}:
                 if os.path.basename(p) in ALL_TRIGGERS: return self.all
             if old is None or new is None or old != new or flags and not hunks:      # add / delete / rename / mode / binary
                 for p in {old, new} - {None}:
-                    sel |= self.note(self.readers(p, True) | self.file_tests(p))
+                    sel |= self.note(self.readers(p, True) | self.file_tests(p) | self.by_file.get(p, 0))
                     if p.endswith(".py") and p.startswith("sqlglot/"): sel |= self.note(self.subproc)
-                    if p.endswith("__init__.py") or (p.endswith(".py") and old != new and old and new): return self.all
+                    if p.endswith("__init__.py"): return self.all
                 if old is None or new is None: continue
             path = old
             if not path.endswith(".py"):
@@ -240,6 +340,7 @@ class Selector:
         except OSError:
             return self.all
         old_lines = old_text.split("\n")
+        if not hunks_fit(old_lines, hunks): return self.all          # not a patch against the pinned file
         new_lines, removed, anchors = apply_hunks(old_lines, hunks)
         try:
             old_tree = ast.parse(old_text)
@@ -253,7 +354,13 @@ class Selector:
             return self.note(whole)
         if ast.dump(old_tree) == ast.dump(new_tree):
             return 0
+        if strip_docstrings(old_tree) == strip_docstrings(new_tree) and not self.reads_docstrings():
+            return 0                           # only docstrings differ, and no numbered test file reads docstrings
+        old_tree = ast.parse(old_text)         # (strip_docstrings edits the tree it is given)
+        new_tree = ast.parse("\n".join(new_lines))
         idx = Index(old_tree); r = 0
+        for name in sorted(bound_defs(old_tree) - bound_defs(new_tree)):
+            r |= self.note(self.gone_name(name, path, idx))
         n = len(old_lines)
         sk_old, fns_old, own_old = strip_bodies(old_tree)
         sk_new, fns_new, own_new = strip_bodies(new_tree)
@@ -307,6 +414,7 @@ HEAVY_DROP = os.environ.get("BR_HEAVY_DROP", "1") == "1"
 WALL_BUDGET = float(os.environ.get("BR_WALL", "110"))
 TMP = os.environ.get("BR_TMP", "/tmp")
 POOL_FILES = ("tests/test_optimizer.py", "tests/test_executor.py")
+CONCURRENCY = int(os.environ.get("BR_JOBS", "1"))      # one at a time: test processes start many threads, and pids are limited
 
 
 def hunks_fit(old_lines, hunks):
@@ -379,6 +487,12 @@ def _child(root, ids, out, per_test_timeout):
         nul = os.open(os.devnull, os.O_RDWR)
         for fd in (0, 1, 2): os.dup2(nul, fd)
         os.chdir(root)
+        try:                                   # if a patched loop eats the memory, this process is the one to go
+            with open("/proc/self/oom_score_adj", "w") as fh: fh.write("1000")
+        except OSError:
+            pass
+        os.makedirs(root + ".tmp", exist_ok=True); os.environ["TMPDIR"] = root + ".tmp"
+        import tempfile; tempfile.tempdir = None
         here = os.path.dirname(os.path.abspath(__file__))
         sys.path[:] = [root] + [p for p in sys.path if p not in ("", here, str(SRC))]
         # one pool worker: the tests' process pools would otherwise start a worker per host CPU, each paying an import
@@ -413,11 +527,11 @@ def run_jobs(jobs, deadline):
                     results[key] = (bad & set(ids), list(ids))
         except Exception:
             pass
-        shutil.rmtree(root, ignore_errors=True)
+        shutil.rmtree(root, ignore_errors=True); shutil.rmtree(root + ".tmp", ignore_errors=True)
         try: os.remove(out)
         except OSError: pass
     while queue or running:
-        while queue and len(running) < 2 and time.time() < deadline:
+        while queue and len(running) < CONCURRENCY and time.time() < deadline:
             key, edits, ids, est = queue.pop(0)
             seq += 1
             root = os.path.join(TMP, f"br-{os.getpid()}-{seq}"); out = root + ".json"
@@ -494,7 +608,7 @@ def main():
             files = parse_patch(text)
             if not any((p or "").endswith(".py") for f in files for p in f[:2]): continue      # data files: schedule as selected
             # light = every selected test short enough to run here; heavy ones are decided from the light results (see below)
-            light = [n for n in nums if ms[n] < HEAVY_MS]
+            light = [n for n in nums if ms[n] < HEAVY_MS and tid[n].split("::")[0] not in s.resolvers()]
             if not light: continue
             lset = set(light); rest = [n for n in nums if n not in lset]
             heavy = [n for n in rest if ms[n] >= HEAVY_MS]

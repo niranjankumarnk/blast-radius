@@ -330,7 +330,23 @@ def m_testassert(p):
     return m_const(p, "func") or m_cmp(p)
 
 
+def m_lambda(p):
+    text = read(p); lines = text.split("\n"); c = []
+    for n in ast.walk(tree(p)):
+        if isinstance(n, ast.Lambda):
+            for x in ast.walk(n.body):
+                if isinstance(x, ast.Constant) and x.lineno == x.end_lineno and seg(lines, x) and isinstance(x.value, (bool, int, str)) and "\\" not in text[seg(lines, x)[0]:seg(lines, x)[1]]:
+                    c.append((seg(lines, x), x.value))
+                elif isinstance(x, ast.Attribute) and x.lineno == x.end_lineno and seg(lines, x):
+                    c.append((seg(lines, x), None))
+    if not c: return None
+    (s_, e), v = pick(c)
+    new = "None" if v is None else "False" if v is True else "True" if v is False else str(v + 1) if isinstance(v, int) else repr(v + "X")
+    return text[:s_] + new + text[e:]
+
+
 PY_OPS = {
+    "lambda": m_lambda,
     "cmp": m_cmp, "bool": m_bool, "const": m_const, "delstmt": m_delstmt, "retnone": m_retnone, "default": m_default,
     "signature": m_signature, "classattr": m_classattr, "modconst": m_modconst, "decorator": m_decorator, "import": m_import,
     "funcdel": m_funcdel, "funcrename": m_funcrename, "comment": m_comment, "docstring": m_docstring, "annotation": m_annotation,
@@ -363,7 +379,13 @@ def diff_file(path, old, new):
     return text
 
 
+FOCUS = os.environ.get("MUT_FILES"); FOCUS_OPS = [o for o in os.environ.get("MUT_OPS", "").split(",") if o]
+
+
 def gen_one():
+    if FOCUS:
+        p = pick([x for x in PY_SRC if re.search(FOCUS, x)]); op = pick(FOCUS_OPS or list(PY_OPS)); new = PY_OPS[op](p)
+        return ("focus:" + op, diff_file(p, read(p), new)) if new is not None else None
     kind = rng.choices(
         ["py", "py_core", "py_init", "test_py", "conftest", "fixture", "other", "newfile", "delfile", "rename", "gz", "multi"],
         [46, 10, 5, 7, 1, 7, 5, 5, 4, 3, 1, 6])[0]
