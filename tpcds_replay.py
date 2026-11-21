@@ -19,10 +19,11 @@ class _Stop(BaseException):
 
 
 class Replay:
-    def __init__(self, sample=1):
+    def __init__(self, sample=1, pickled=None):
         """sample=k keeps every k-th row of the larger tables: the same queries on less data, for a cheaper run."""
         from tests.helpers import FIXTURES_DIR, TPCDS_SCHEMA, load_sql_fixture_pairs
         self.sample = sample
+        self.pickled = pickle.load(open(pickled, "rb")) if pickled else None      # {table: pickle of the Table}, see expected()
         self.dir = FIXTURES_DIR + "/optimizer/tpc-ds/"
         self.schema = TPCDS_SCHEMA
         self.sqls = list(load_sql_fixture_pairs("optimizer/tpc-ds/tpc-ds.sql"))
@@ -51,7 +52,10 @@ class Replay:
     def worker_table(self, name):
         """The worker process's copy of a table (the test pickles every table to its workers once)."""
         if name not in self.worker:
-            self.worker[name] = pickle.loads(pickle.dumps(self.table(name)))
+            if self.pickled and name in self.pickled:                   # the same pickle, made when the image was built
+                self.worker[name] = pickle.loads(self.pickled[name])
+            else:
+                self.worker[name] = pickle.loads(pickle.dumps(self.table(name)))
             self.snapshot[name] = list(self.worker[name].rows)
         return self.worker[name]
 
@@ -108,30 +112,62 @@ class Replay:
     def canon(self, o, refs=None):
         """A canonical text of an object graph that uses no sqlglot method: class names, attributes and containers."""
         refs = {} if refs is None else refs
-        if o is None or isinstance(o, (bool, int, float, str, bytes)): return repr(o)
-        if isinstance(o, enum.Enum): return f"{type(o).__name__}.{o.name}"
-        if isinstance(o, type): return f"<class {o.__module__}.{o.__qualname__}>"
-        if isinstance(o, (list, tuple)): return "[" + ",".join(self.canon(x, refs) for x in o) + "]"
-        if isinstance(o, (set, frozenset)): return "{" + ",".join(sorted(self.canon(x, dict(refs)) for x in o)) + "}"
-        if isinstance(o, dict): return "{" + ",".join(self.canon(k, refs) + ":" + self.canon(v, refs) for k, v in o.items()) + "}"
-        cls = f"{type(o).__module__}.{type(o).__qualname__}"
-        if callable(o) and not hasattr(o, "args"):
-            owner = getattr(o, "__self__", None)
-            return f"<callable {getattr(o, '__module__', '')}.{getattr(o, '__qualname__', cls)}{' of ' + type(owner).__qualname__ if owner is not None and not isinstance(owner, type(csv)) else ''}>"
-        if id(o) in refs: return f"<seen {refs[id(o)]}>"
-        refs[id(o)] = len(refs)
-        if cls == "sqlglot.executor.table.Table":                           # rows: the very tuples that were loaded, in order
-            name = next((n for n, t in self.worker.items() if t is o), None)
-            snap = self.snapshot.get(name)
-            same = snap is not None and len(o.rows) == len(snap) and all(map(operator.is_, o.rows, snap))
-            return f"<Table {name} {self.canon(o.columns, refs)} {self.canon(o.column_range, refs)} rows={'loaded' if same else hashlib.sha256(repr(o.rows).encode()).hexdigest()}>"
-        state = {}
-        for klass in type(o).__mro__:
-            for slot in getattr(klass, "__slots__", ()) if isinstance(getattr(klass, "__slots__", ()), (tuple, list)) else ():
-                if hasattr(o, slot): state.setdefault(slot, getattr(o, slot))
-        state.update(getattr(o, "__dict__", {}))
-        skip = ("parent", "arg_key", "index", "_hash", "dependents", "_dag", "__weakref__")
-        return f"<{cls} " + ",".join(k + "=" + self.canon(v, refs) for k, v in state.items() if k not in skip) + ">"
+        out = []; add = out.append; plain = (bool, int, float, str, bytes); skip = _SKIP; slots = _slots
+        def walk(o):
+            if o is None or type(o) in plain: add(repr(o)); return
+            t = type(o)
+            if t is list or t is tuple:
+                add("[")
+                for x in o: walk(x); add(",")
+                add("]"); return
+            if t is dict:
+                add("{")
+                for k, v in o.items(): walk(k); add(":"); walk(v); add(",")
+                add("}"); return
+            if isinstance(o, plain): add(repr(o)); return
+            if isinstance(o, enum.Enum): add(t.__name__ + "." + o.name); return
+            if isinstance(o, type): add("<class " + o.__module__ + "." + o.__qualname__ + ">"); return
+            if isinstance(o, (list, tuple, dict)): walk(list(o.items()) if isinstance(o, dict) else list(o)); return
+            if isinstance(o, (set, frozenset)): add("{" + ",".join(sorted(self.canon(x, dict(refs)) for x in o)) + "}"); return
+            cls = t.__module__ + "." + t.__qualname__
+            if callable(o) and not hasattr(o, "args"):
+                owner = getattr(o, "__self__", None)
+                add("<callable " + str(getattr(o, "__module__", "")) + "." + getattr(o, "__qualname__", cls) + (" of " + type(owner).__qualname__ if owner is not None and not isinstance(owner, type(csv)) else "") + ">"); return
+            i = id(o)
+            if i in refs: add("<seen " + str(refs[i]) + ">"); return
+            refs[i] = len(refs)
+            if cls == "sqlglot.executor.table.Table":                       # rows: the very tuples that were loaded, in order
+                name = next((n for n, tb in self.worker.items() if tb is o), None)
+                snap = self.snapshot.get(name)
+                same = snap is not None and len(o.rows) == len(snap) and all(map(operator.is_, o.rows, snap))
+                add("<Table " + str(name) + " "); walk(o.columns); walk(o.column_range)
+                add(" rows=" + ("loaded" if same else hashlib.sha256(repr(o.rows).encode()).hexdigest()) + ">"); return
+            add("<" + cls + " ")
+            done = None
+            for k in slots(t):
+                if k not in skip and hasattr(o, k): add(k + "="); walk(getattr(o, k)); add(",")
+            d = getattr(o, "__dict__", None)
+            if d:
+                for k, v in d.items():
+                    if k not in skip: add(k + "="); walk(v); add(",")
+            add(">")
+        walk(o)
+        return "".join(out)
+
+
+_SKIP = frozenset(("parent", "arg_key", "index", "_hash", "dependents", "_dag", "__weakref__", "__dict__"))
+_SLOTS = {}
+
+
+def _slots(t):
+    if t not in _SLOTS:
+        names = []
+        for klass in t.__mro__:
+            sl = klass.__dict__.get("__slots__", ())
+            for k in (sl,) if isinstance(sl, str) else sl:
+                if k not in names: names.append(k)
+        _SLOTS[t] = tuple(names)
+    return _SLOTS[t]
 
 
 def expected(out, sample=1):
@@ -148,6 +184,8 @@ def expected(out, sample=1):
         t0 = time.process_time(); digest.append(r.run(i)); cost.append(round(time.process_time() - t0, 3)); needs.append(names)
     with open(out, "w") as fh:
         json.dump({"digest": digest, "cost": cost, "cdigest": cdigest, "ccost": ccost, "tables": needs, "load": load}, fh)
+    with open(out + ".tables", "wb") as fh:                                  # what the test's workers are sent
+        pickle.dump({n: pickle.dumps(r.table(n)) for n in load}, fh)
     return digest
 
 

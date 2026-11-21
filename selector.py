@@ -992,7 +992,9 @@ def _units_child(root, kind, units, exp, out, tmpd):
         try:
             if kind == "tpcds":
                 from tpcds_replay import Replay
-                r = Replay()
+                tables = os.path.join(here, "tpcds_expected.json.tables")
+                # (prebuilt table pickles only when no query is executed: then no changed code can touch a Table)
+                r = Replay(pickled=tables if os.path.exists(tables) and not any(f for _, f in units) else None)
                 check = lambda u, full: (r.run(u) == exp["digest"][u]) if full else (r.compile(u) == exp["cdigest"][u])
             else:
                 import gm_replay

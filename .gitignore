@@ -31,3 +31,5 @@ build/g/expected.native.json
 build/q/expected.native.json
 build/q/phase/
 gen/phase_lines.json
+tpcds_expected.json.tables
+gen/set*cval.log
