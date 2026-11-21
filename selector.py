@@ -914,6 +914,127 @@ def run_once(edits, ids, est, deadline, label):
     return res
 
 
+# ---- an exact verdict for two heavy tests, unit by unit ----------------------------------------------------------
+# test_generator_memory checks each dialect in its own subtest and test_execute_tpcds each TPC-DS query. A second
+# map of the same kind as map.bin (gmap.bin, qmap.bin) records what each unit executes on the pinned commit, so
+# the selector can tell which units a patch can affect. It replays just those in the container on the patched
+# tree (gm_replay.py, tpcds_replay.py: the test's own steps, without pytest). If every affected unit still gives
+# what the test needs, the test cannot fail and is not scheduled; otherwise it stays.
+GM_LIMIT = 512                    # bytes; the test asserts under 1,024 and the pinned commit measures 32
+EXACT = os.environ.get("BR_EXACT", "1") == "1"
+EXACT_RATIO = float(os.environ.get("BR_EXACT_RATIO", "0.7"))
+UNIT_TESTS = (("tests/test_generator.py::TestGenerator::test_generator_memory", "gmap.bin", "gm_expected.json", "gm"),
+              ("tests/test_executor.py::TestExecutor::test_execute_tpcds", "qmap.bin", "tpcds_expected.json", "tpcds"))
+
+
+class Units:
+    def __init__(self, tests, real, map_name, exp_name, kind):
+        here = Path(__file__).parent; self.kind, self.ok = kind, False
+        try:
+            self.exp = json.loads((here / exp_name).read_text())       # the pinned commit's results and CPU costs, from the image build
+            ids = pickle.loads(zlib.decompress((here / map_name).read_bytes()))["ids"]
+            self.sel = Selector([{"id": i, "number": k} for k, i in enumerate(ids)], here / map_name)
+            self.n = len(ids) - 1                                      # the last id is "harness": what only the real test executes
+            self.test = next(t["number"] for t in tests if t["id"] == real)
+            self.ok = len(self.exp["cost"]) == self.n
+        except Exception as e:
+            print(f"{kind}: unit replay off: {type(e).__name__}: {e}", file=sys.stderr)
+
+    def units(self, patch_text):
+        """The units the patch can affect, cheapest first; None when the test cannot be judged unit by unit."""
+        b = self.sel.select(patch_text)
+        if not b or b == self.sel.all or b >> self.n & 1: return None
+        return sorted((u for u in range(self.n) if b >> u & 1), key=lambda u: self.exp["cost"][u])
+
+    def estimate(self, units):
+        load = sum(self.exp["load"].get(t, 0) for t in {t for u in units for t in self.exp["tables"][u]}) if self.kind == "tpcds" else 0
+        return 0.6 + 1.2 * (sum(self.exp["cost"][u] for u in units) + load)
+
+
+def _units_child(root, kind, units, exp, out, tmpd):
+    try:
+        os.setsid()
+        nul = os.open(os.devnull, os.O_RDWR)
+        for fd in (0, 1, 2): os.dup2(nul, fd)
+        os.chdir(root)
+        try:
+            with open("/proc/self/oom_score_adj", "w") as fh: fh.write("1000")
+        except OSError:
+            pass
+        import tempfile
+        os.environ["TMPDIR"] = tmpd; tempfile.tempdir = None
+        here = os.path.dirname(os.path.abspath(__file__))
+        sys.path[:] = [root, here] + [p for p in sys.path if p not in ("", here, str(SRC), root)]
+        os.environ.update(PYTHONPATH=root, SKIP_INTEGRATION="0", PYTHONDONTWRITEBYTECODE="1")
+        sys.dont_write_bytecode = True
+        bad = None
+        try:
+            if kind == "tpcds":
+                from tpcds_replay import Replay
+                r = Replay()
+                check = lambda u: r.run(u) == exp["digest"][u]
+            else:
+                import gm_replay
+                check = lambda u: gm_replay.run(exp["names"][u]) <= GM_LIMIT
+            for u in units:
+                if not check(u): bad = u; break                        # one unit is enough to keep the test
+        except BaseException:
+            bad = units[0] if bad is None else bad
+        with open(out + ".tmp", "w") as fh: json.dump({"bad": bad}, fh)
+        os.rename(out + ".tmp", out)
+    finally:
+        os._exit(0)
+
+
+def run_units(edits, obj, units, est, deadline, label):
+    """Replay units of a heavy test in a forked child on the patched tree (edits) or the pinned tree (edits is None).
+    -> (True, None) when every unit is as the test needs, (False, unit) for the first that is not, (None, None)
+    for no answer."""
+    if time.time() >= deadline: return None, None
+    _SEQ[0] += 1
+    base = os.path.join(TMP, f"br-{os.getpid()}-{_SEQ[0]}"); out = base + ".json"; tmpd = base + ".tmp"; root = str(SRC)
+    def cleanup():
+        if edits is not None: shutil.rmtree(base, ignore_errors=True)
+        shutil.rmtree(tmpd, ignore_errors=True)
+        try: os.remove(out)
+        except OSError: pass
+    try:
+        if edits is not None:
+            root = base; shutil.rmtree(root, ignore_errors=True); build_overlay(root, edits)
+        os.makedirs(tmpd, exist_ok=True)
+        sys.stdout.flush(); sys.stderr.flush()
+        pid = os.fork()
+    except Exception:
+        cleanup(); return None, None
+    if pid == 0: _units_child(root, obj.kind, units, obj.exp, out, tmpd)
+    limit = time.time() + max(8, est * 2.5 + 4); status = cpu = None
+    while True:
+        try:
+            p, st, ru = os.wait4(pid, os.WNOHANG)
+        except ChildProcessError:
+            break
+        if p == pid:
+            status, cpu = st, ru.ru_utime + ru.ru_stime; break
+        if time.time() > limit: break
+        time.sleep(0.01)
+    try: os.killpg(pid, signal.SIGKILL)
+    except OSError: pass
+    try:
+        while os.waitpid(-1, 0 if status is None else os.WNOHANG)[0] > 0 and status is not None: pass
+    except ChildProcessError:
+        pass
+    res = (None, None)
+    try:
+        if status is not None and os.WIFEXITED(status) and os.path.exists(out):
+            bad = json.load(open(out))["bad"]
+            res = (True, None) if bad is None else (False, bad)
+    except Exception:
+        res = (None, None)
+    cleanup()
+    print(f"{label}: replayed {len(units)} {obj.kind} units, {'no answer' if res[0] is None else 'all as on the pinned commit' if res[0] else 'one differs'}, cpu {cpu if cpu is None else round(cpu, 2)} s", file=sys.stderr)
+    return res
+
+
 def pack_cost(numbers, ms):
     if not numbers: return 0
     ws = pack(numbers, ms)
@@ -944,7 +1065,7 @@ def main():
     tests = json.loads((DATA / "tests.json").read_text())["tests"]
     ms = {t["number"]: round(t["seconds"] * 1000) for t in tests}
     tid = {t["number"]: t["id"] for t in tests}; tnum = {t["id"]: t["number"] for t in tests}
-    s = Selector(tests); chosen, parts, edits_of, jobs = {}, {}, {}, []
+    s = Selector(tests); chosen, parts, edits_of, jobs, texts = {}, {}, {}, [], {}
     inv = {n: i for i, n in enumerate(s.remap)} if s.remap else {t["number"]: t["number"] for t in tests}
     def witness_plan(cid, broken):
         """(heavy tests, witnesses to run, estimate, saving) when the commit's heavy tests can be decided by cheaper
@@ -972,6 +1093,7 @@ def main():
         if s.remap: nums = [s.remap[i] for i in nums if s.remap[i] is not None] + (s.unknown if nums else [])
         chosen[patch.stem] = nums
         parts[patch.stem] = list(getattr(s, "parts", []))
+        if nums and b != s.all: texts[patch.stem] = text
         if not RUN or not nums or b == s.all or s.remap: continue
         try:
             # Only a selection that carries a heavy test (five seconds or more) is worth a run: the heavy test is
@@ -987,12 +1109,40 @@ def main():
             edits_of[patch.stem] = edits; jobs.append((saving - est, patch.stem))
         except Exception as e:
             print(f"{patch.stem}: plan {type(e).__name__}: {e}", file=sys.stderr)
+    # Exact verdicts first: a heavy test whose affected units all behave as on the pinned commit is not scheduled.
+    exact = [Units(tests, *u) for u in UNIT_TESTS] if EXACT and not s.remap else []
+    ejobs = []
+    for cid, nums in chosen.items():
+        for obj in exact:
+            try:
+                if not obj.ok or obj.test not in nums or cid not in texts: continue
+                us = obj.units(texts[cid])
+                if us is None: continue
+                est = obj.estimate(us)
+                saving = (pack_cost(nums, ms) - pack_cost([n for n in nums if n != obj.test], ms)) / 1000
+                print(f"{cid}: {obj.kind} affects {len(us)} of {obj.n} units est={est:.1f} saving={saving:.1f}", file=sys.stderr)
+                if est <= MAX_EST and est <= EXACT_RATIO * saving: ejobs.append((saving - est, cid, obj, us, est))
+            except Exception as e:
+                print(f"{cid}: units {type(e).__name__}: {e}", file=sys.stderr)
+    for _, cid, obj, us, est in sorted(ejobs, key=lambda j: -j[0]):
+        try:
+            if not obj.ok: continue
+            if cid not in edits_of: edits_of[cid] = patch_edits(parse_patch(texts[cid]))
+            if edits_of[cid] is None: continue
+            same, bad = run_units(edits_of[cid], obj, us, est, t0 + WALL_BUDGET, cid)
+            if same:
+                chosen[cid] = [n for n in chosen[cid] if n != obj.test]
+                print(f"{cid}: {obj.kind} cannot fail: not scheduled", file=sys.stderr)
+            elif same is False and run_units(None, obj, [bad], obj.estimate([bad]), t0 + WALL_BUDGET, cid + " (unpatched)")[0] is False:
+                obj.ok = False               # the unit differs here even without the patch: this container cannot replay it
+        except Exception as e:
+            print(f"{cid}: replay {type(e).__name__}: {e}", file=sys.stderr)
     broken = set()                 # tests that fail here on the unpatched tree: this container cannot judge them
     for _, cid in sorted(jobs, reverse=True):
         try:
             deadline = t0 + WALL_BUDGET
             heavy, wit, est, _ = witness_plan(cid, broken)
-            if not heavy: continue
+            if not heavy or edits_of.get(cid) is None: continue
             ids = [tid[n] for n in wit]
             bad = run_once(edits_of[cid], ids, est, deadline, cid)
             if bad is None: continue                                     # no answer: keep the static selection

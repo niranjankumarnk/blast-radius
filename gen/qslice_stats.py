@@ -4,8 +4,8 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__))); os.environ.u
 import selector as S
 tests = json.load(open(ROOT + '/sample/tests.json'))['tests']
 sel = S.Selector(tests)
-qm = pickle.loads(zlib.decompress(open(ROOT + '/build/q/qmap.bin', 'rb').read()))
-qsel = S.Selector([{"id": i, "number": k} for k, i in enumerate(qm['ids'])], ROOT + '/build/q/qmap.bin')
+qm = pickle.loads(zlib.decompress(open(ROOT + '/qmap.bin', 'rb').read()))
+qsel = S.Selector([{"id": i, "number": k} for k, i in enumerate(qm['ids'])], ROOT + '/qmap.bin')
 exp = json.load(open(sys.argv[1])); cost = exp['cost']; H = len(qm['ids']) - 1
 REAL = [t['number'] for t in tests if t['id'] == qm['real']][0]
 def affected(text):

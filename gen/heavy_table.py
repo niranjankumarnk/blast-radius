@@ -45,6 +45,11 @@ def cases():
                 hf = {h for h in r["heavy_nums"] if name[h] in r["heavy_failed"]}
                 seen.add(f[:-5])
                 yield (sd, f[:-5], r["kind"], r["heavy_nums"], r["witness_nums"], [set(p) for p in r["parts"]], set(r["witness_failed_nums"]) | hf)
+        if os.path.isdir(os.path.join(d, "h2")):               # non-pool witnesses only: evidence for the "nonpool" rule alone
+            for f in sorted(os.listdir(os.path.join(d, "h2"))):
+                if f[:-5] in seen: continue
+                r = json.load(open(os.path.join(d, "h2", f))); seen.add(f[:-5])
+                yield (sd + ":nonpool-only", f[:-5], r["kind"], r["heavy_nums"], r["witness_nums"], [set(p) for p in r["parts"]], set(r["witness_failed_nums"]) | set(r["heavy_failed_nums"]))
         if os.path.isdir(os.path.join(d, "labels")):
             for f in sorted(os.listdir(os.path.join(d, "labels"))):
                 c = f[:-5]
@@ -71,7 +76,7 @@ def witnesses(rule, wit, parts, heavy):
 
 tab = collections.defaultdict(lambda: collections.Counter()); wrong = []; est = collections.defaultdict(list)
 for src, cid, kind, heavy, wit, parts, failing in cases():
-    for rule in ("all", "nonpool", "min3"):
+    for rule in (("nonpool",) if src.endswith(":nonpool-only") else ("all", "nonpool", "min3")):
         W = witnesses(rule, wit, parts, heavy)
         for h in heavy:
             key = (name[h], rule)

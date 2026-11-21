@@ -36,7 +36,26 @@ or removed, or passes a point where one was inserted:
 
 Selected tests are packed longest-first onto 1 to 8 workers, whichever count costs least.
 
-## Heavy tests
+## Heavy tests, exactly where possible
+
+Two of the slow tests are loops over independent units: `test_generator_memory` checks every dialect in its own
+subtest, and `test_execute_tpcds` every TPC-DS query. `gmap.bin` and `qmap.bin` are maps of the same kind as
+`map.bin`, built from the pinned commit, whose "tests" are those units (plus one entry for what only the real
+test executes: its own body, the class set-up, the process pool). When a selection carries one of these tests,
+the same statement-level rules run against the unit map and name the units the patch can affect. If replaying
+them is cheap enough, the selector does it in the container on the patched tree (`gm_replay.py`,
+`tpcds_replay.py`: the test's own steps, without pytest or DuckDB):
+
+- for a dialect, the memory left behind by 1,000 generators, which the test asserts on;
+- for a query, a digest of the DuckDB SQL and of the executor's result table, which are all that sqlglot
+  contributes to the test's comparison. The image build computes the pinned commit's digests.
+
+If every affected unit behaves as on the pinned commit, the test cannot fail and is not scheduled. If one does
+not, or the patch touches what only the real test executes, the test stays. This is not a bet: an unaffected unit
+executes no changed code. A unit that differs is re-run on the unpatched tree; if it differs there too, the
+container cannot replay it and the mechanism turns itself off. `BR_EXACT=0` turns it off.
+
+## Heavy tests, by witnesses
 
 Three tests take 6 to 29 seconds each, so one of them decides the cost of any commit that selects it. When a
 selection carries one, and the cheaper selected tests are cheap enough to run (an estimate from measured CPU
@@ -82,8 +101,9 @@ out a flaky test. They are used only to measure the selector: nothing from them 
 cheaper selected tests fail, and does the heavy test), and `gen/heavy_table.py` tabulates how often each rule
 would drop a heavy test and how often that would be wrong. `tpcds_replay.py` replays `test_execute_tpcds` query by
 query without pytest or DuckDB; `gen/replay_eval.py` uses it as a faster source of that test's verdict, and
-`build/mkqmap.py` / `gen/qslice_stats.py` measure how many queries a patch can affect. None of these ship in the
-image.
+`build/mkumap.py` builds the unit maps, `gen/units_eval.py` checks the exact verdicts against labels, and
+`gen/qslice_stats.py` measures how many queries a patch can affect. Apart from the two replay modules, none of
+these ship in the image.
 
 ## Pre-existing code
 

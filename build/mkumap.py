@@ -1,22 +1,22 @@
-"""Build qmap.bin: the same kind of map as map.bin, but its "tests" are the 99 per-query replays of
-test_execute_tpcds (tpcds_replay.py, build/q/) plus one pseudo-test, "harness".
+"""Build a unit map: the same kind of map as map.bin, but its "tests" are the units of one heavy test (the 99
+per-query replays of test_execute_tpcds, the 33 per-dialect replays of test_generator_memory) plus one pseudo-test,
+"harness".
 
 "harness" stands for everything the real test executes that no replay does (its own body, the class set-up, the
 process pool): every line, file read, function entry and class instantiation that map.bin records for the real
-test and no replay shows. A patch that selects "harness" cannot be judged query by query.
+test and no replay shows. A patch that selects "harness" cannot be judged unit by unit.
 
-usage: mkqmap.py MAP_BIN TESTS_JSON OUT      (after iso.py / isofn.py have run on build/q/tests.json)
-
-build/q/tests.json lists one pytest id per query, {"tests": [{"number": i, "id": "<absolute path of
-build/q/test_tpcds_replay.py>::test_q[i]", ...}]}; it holds local paths, so it is generated, not committed.
+usage: mkumap.py MAP_BIN UNIT_DIR REAL_TEST_ID PREFIX OUT
+       (after iso.py / isofn.py have run on UNIT_DIR/tests.json, which lists one pytest id per unit as
+        {"tests": [{"number": i, "id": "<absolute path of the replay test file>::test[i]", ...}]}; it holds local
+        paths, so it is generated, not committed)
 """
 import json, os, pickle, subprocess, sys, zlib
 HERE = os.path.dirname(os.path.abspath(__file__)); ROOT = os.path.dirname(HERE)
-main_map, tests_json, out = sys.argv[1:4]
-REAL = "tests/test_executor.py::TestExecutor::test_execute_tpcds"
+main_map, unit_dir, REAL, prefix, out = sys.argv[1:6]
 tmp = out + ".raw"
-env = dict(os.environ, MAP_ISO=os.path.join(HERE, "q", "iso"), MAP_FN=os.path.join(HERE, "q", "fn"))
-subprocess.run([sys.executable, os.path.join(HERE, "mkmap.py"), os.path.join(HERE, "q", "tests.json"), tmp], env=env, check=True)
+env = dict(os.environ, MAP_ISO=os.path.join(unit_dir, "iso"), MAP_FN=os.path.join(unit_dir, "fn"))
+subprocess.run([sys.executable, os.path.join(HERE, "mkmap.py"), os.path.join(unit_dir, "tests.json"), tmp], env=env, check=True)
 q = pickle.loads(zlib.decompress(open(tmp, "rb").read())); os.remove(tmp)
 m = pickle.loads(zlib.decompress(open(main_map, "rb").read()))
 real = m["ids"].index(REAL); n = len(q["ids"]); hbit = 1 << n
@@ -47,12 +47,8 @@ for f, d in m["fn"].items():
 inst = {c: qb(i) for c, i in q["inst"].items()}
 for c, i in m["inst"].items():
     if mb(i) >> real & 1 and not inst.get(c): inst[c] = hbit
-cost = []
-for i in range(n):
-    p = os.path.join(HERE, "q", "out", f"{i}.txt")
-    cost.append(float(open(p).read().split()[1]) if os.path.exists(p) else 1.0)
-blob = zlib.compress(pickle.dumps({"ids": [f"tpcds::q{i}" for i in range(n)] + ["harness"], "sets": sets, "files": files, "reads": {k: sid(v) for k, v in reads.items()},
+blob = zlib.compress(pickle.dumps({"ids": [f"{prefix}{i}" for i in range(n)] + ["harness"], "sets": sets, "files": files, "reads": {k: sid(v) for k, v in reads.items()},
                                    "subproc": 0, "fn": {f: {l: sid(b) for l, b in d.items()} for f, d in fn.items()},
-                                   "inst": {c: sid(b) for c, b in inst.items()}, "fn_missing": q.get("fn_missing", 0), "cost": cost, "real": REAL}, protocol=5), 9)
+                                   "inst": {c: sid(b) for c, b in inst.items()}, "fn_missing": q.get("fn_missing", 0), "real": REAL}, protocol=5), 9)
 open(out, "wb").write(blob)
-print("replays", n, "lines only the real test reaches", added, "bytes", len(blob), "native cpu of all replays", round(sum(cost), 1), file=sys.stderr)
+print("units", n, "lines only the real test reaches", added, "bytes", len(blob), file=sys.stderr)
