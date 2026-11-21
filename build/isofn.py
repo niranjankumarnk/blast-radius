@@ -2,7 +2,7 @@
 import json, os, subprocess, sys
 from concurrent.futures import ThreadPoolExecutor
 HERE = os.path.dirname(os.path.abspath(__file__)); ROOT = os.path.realpath(sys.argv[1]); TESTS = sys.argv[2]
-OUT = os.path.join(HERE, "fn"); os.makedirs(OUT, exist_ok=True)
+OUT = os.environ.get("ISO_OUT") or os.path.join(HERE, "fn"); os.makedirs(OUT, exist_ok=True)      # (ISO_OUT: another set of tests, e.g. build/q)
 tests = json.load(open(TESTS))["tests"]
 def run(t):
     out = os.path.join(OUT, f"{t['number']}.json")

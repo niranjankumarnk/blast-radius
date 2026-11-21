@@ -282,8 +282,9 @@ NAME_RE = re.compile(r"^[A-Z][A-Z0-9_]{2,}$")
 
 
 class Selector:
-    def __init__(self, tests):
-        m = pickle.loads(zlib.decompress(MAP.read_bytes()))
+    def __init__(self, tests, map_path=None):
+        m = pickle.loads(zlib.decompress(Path(map_path or MAP).read_bytes()))
+        self.meta = m
         self.sets, self.files, self.reads, self.subproc = m["sets"], m["files"], m["reads"], m["subproc"]
         self.fn, self.inst, self.fn_missing = m.get("fn", {}), m.get("inst", {}), m.get("fn_missing", 0)
         self._src = None; self._tsrc = None; self._docs = None; self._res = None; self._idx = {}; self._tokens = None
@@ -297,7 +298,7 @@ class Selector:
         self.test_dirs = set()
         for f in self.by_file:
             d = os.path.dirname(f)
-            while d: self.test_dirs.add(d); d = os.path.dirname(d)
+            while d and d not in self.test_dirs: self.test_dirs.add(d); d = os.path.dirname(d)
 
     def bits(self, idx): return int.from_bytes(self.sets[idx], "little")
 
@@ -845,7 +846,8 @@ def _child(root, ids, out, tmpd, per_test_timeout):
         sys.dont_write_bytecode = True
         import pytest
         rec = _Recorder()
-        code = pytest.main(["-q", "-p", "no:cacheprovider", "--timeout", str(per_test_timeout), *ids], plugins=[rec])
+        # -x: one failure already decides (the static selection is kept), so stop there
+        code = pytest.main(["-q", "-x", "-p", "no:cacheprovider", "--timeout", str(per_test_timeout), *ids], plugins=[rec])
         with open(out + ".tmp", "w") as fh:
             json.dump({"code": int(code), "failed": sorted(rec.failed), "seen": sorted(rec.seen), "collect": rec.collect}, fh)
         os.rename(out + ".tmp", out)
@@ -879,8 +881,8 @@ def run_once(edits, ids, est, deadline, label):
         pid = os.fork()
     except Exception:
         cleanup(); return None
-    if pid == 0: _child(root, ids, out, tmpd, int(max(20, est * 4)))
-    limit = time.time() + max(20, est * 3 + 10); status = cpu = None
+    if pid == 0: _child(root, ids, out, tmpd, int(max(5, est * 2)))
+    limit = time.time() + max(8, est * 2.5 + 4); status = cpu = None      # a patched loop that never ends is cut off here
     while True:
         try:
             p, st, ru = os.wait4(pid, os.WNOHANG)
@@ -901,8 +903,9 @@ def run_once(edits, ids, est, deadline, label):
         if status is not None and os.WIFEXITED(status) and os.path.exists(out):
             d = json.load(open(out))
             if d["code"] in (0, 1):
-                idset = set(ids); bad = set(d["failed"]) | (idset - set(d["seen"]))
+                idset = set(ids); bad = set(d["failed"])
                 for c in d["collect"]: bad |= {i for i in idset if i.split("::")[0] == c or not c.endswith(".py")}
+                if not bad: bad = idset - set(d["seen"])              # (after a failure the run stops, so the rest is unseen)
                 res = bad & idset
     except Exception:
         res = None
@@ -944,13 +947,21 @@ def main():
     s = Selector(tests); chosen, parts, edits_of, jobs = {}, {}, {}, []
     inv = {n: i for i, n in enumerate(s.remap)} if s.remap else {t["number"]: t["number"] for t in tests}
     def witness_plan(cid, broken):
-        """(heavy tests, witnesses) when the commit's heavy tests can be decided by its cheaper selected tests."""
+        """(heavy tests, witnesses to run, estimate, saving) when the commit's heavy tests can be decided by cheaper
+        selected tests at a worthwhile cost; (None, ...) otherwise. Two witness sets are tried: every cheaper selected
+        test, then only those outside the two test files that need pandas, duckdb and worker processes (the others
+        then stay scheduled). Either way every changed spot that selected a heavy test needs MIN_WITNESS witnesses."""
         nums = chosen[cid]
         heavy = [n for n in nums if ms[n] >= HEAVY_MS]
-        wit = [n for n in nums if ms[n] < HEAVY_MS and tid[n].split("::")[0] not in s.resolvers() and tid[n] not in broken]
-        wb = sum(1 << inv[n] for n in wit)
-        ok = heavy and wit and all(bin(p & wb).count("1") >= MIN_WITNESS for p in parts[cid] if any(p >> inv[h] & 1 for h in heavy))
-        return (heavy, wit) if ok else (None, None)
+        cheaper = [n for n in nums if ms[n] < HEAVY_MS and tid[n].split("::")[0] not in s.resolvers() and tid[n] not in broken]
+        for wit in (cheaper, [n for n in cheaper if tid[n].split("::")[0] not in POOL_FILES]) if heavy else ():
+            wb = sum(1 << inv[n] for n in wit)
+            if not wit or not all(bin(p & wb).count("1") >= MIN_WITNESS for p in parts[cid] if any(p >> inv[h] & 1 for h in heavy)): continue
+            est = run_estimate(wit, ms, tid)
+            after = [n for n in nums if n not in heavy and (KEEP_WITNESSES or n not in wit)]
+            saving = (pack_cost(nums, ms) - pack_cost(after, ms)) / 1000
+            if FORCE or (est <= MAX_EST and est <= HEAVY_RATIO * saving): return heavy, wit, est, saving
+        return None, None, 0, 0
     for patch in sorted((DATA / "commits").glob("*.patch")):
         text = patch.read_text(encoding="utf-8", errors="surrogateescape")
         try:
@@ -966,15 +977,11 @@ def main():
             # Only a selection that carries a heavy test (five seconds or more) is worth a run: the heavy test is
             # dropped when every cheaper selected test passes on the patched tree and at least MIN_WITNESS of them
             # exercise each changed spot that selected it. Cheap selections are scheduled as selected.
-            heavy, wit = witness_plan(patch.stem, ())
+            heavy, wit, est, saving = witness_plan(patch.stem, ())
             if not heavy: continue
             files = parse_patch(text)
             if not any((p or "").endswith(".py") for f in files for p in f[:2]): continue
-            est = run_estimate(wit, ms, tid)
-            after = [n for n in nums if n not in heavy and (KEEP_WITNESSES or n not in wit)]
-            saving = (pack_cost(nums, ms) - pack_cost(after, ms)) / 1000
-            print(f"{patch.stem}: plan heavy={len(heavy)} witnesses={len(wit)} est={est:.1f} saving={saving:.1f}", file=sys.stderr)
-            if not FORCE and (est > MAX_EST or est > HEAVY_RATIO * saving): continue
+            print(f"{patch.stem}: plan heavy={len(heavy)} witnesses={len(wit)} of {len(nums) - len(heavy)} est={est:.1f} saving={saving:.1f}", file=sys.stderr)
             edits = patch_edits(files)
             if edits is None: continue
             edits_of[patch.stem] = edits; jobs.append((saving - est, patch.stem))
@@ -984,9 +991,9 @@ def main():
     for _, cid in sorted(jobs, reverse=True):
         try:
             deadline = t0 + WALL_BUDGET
-            heavy, wit = witness_plan(cid, broken)
+            heavy, wit, est, _ = witness_plan(cid, broken)
             if not heavy: continue
-            ids = [tid[n] for n in wit]; est = run_estimate(wit, ms, tid)
+            ids = [tid[n] for n in wit]
             bad = run_once(edits_of[cid], ids, est, deadline, cid)
             if bad is None: continue                                     # no answer: keep the static selection
             if bad:
@@ -996,8 +1003,9 @@ def main():
                 if again is None: continue
                 broken |= again
                 if bad - again: continue                                 # a real failure: keep the static selection
-                heavy, wit = witness_plan(cid, broken)                   # the rule must still hold without the unjudged tests
-                if not heavy: continue
+                ran = set(wit)
+                heavy, wit, _, _ = witness_plan(cid, broken)             # the rule must still hold without the unjudged tests
+                if not heavy or not set(wit) <= ran: continue
             dropped = set(heavy) | (set() if KEEP_WITNESSES else set(wit))
             chosen[cid] = [n for n in chosen[cid] if n not in dropped]
             print(f"{cid}: {len(wit)} cheaper tests pass: dropped {len(heavy)} heavy, scheduling {len(chosen[cid])}", file=sys.stderr)

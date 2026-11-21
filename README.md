@@ -46,8 +46,14 @@ forked child. The heavy test is left out only if every cheaper selected test pas
 exercise each changed spot that selected the heavy test. This is a bet, not a proof: the heavy test could still be
 the only one that fails.
 
+Two of the test files (`test_optimizer.py`, `test_executor.py`) need pandas, duckdb and worker processes, which
+makes their tests expensive to run here. When running every cheaper selected test would cost too much, the
+selector tries the cheaper selected tests outside those two files instead, under the same rule (all pass, three
+per changed spot). The tests it did not run stay scheduled.
+
 - A test that fails on the patched tree is re-run on the unpatched tree. If it fails there too, the container
   cannot judge it: it keeps its static decision and is not counted for or against the heavy test.
+- A run stops at its first failure: one failing test already keeps the static selection.
 - A timeout, a crash, or a patch that cannot be reproduced exactly keeps the static selection.
 - `BR_RUN=0` turns all of this off.
 
@@ -71,6 +77,13 @@ the only one that fails.
 really breaks by running the whole suite, and `gen/label_fast.py` by running only the tests that import or read
 a changed file. `gen/evalset.py` scores the selector against those labels and re-runs any apparent miss to rule
 out a flaky test. They are used only to measure the selector: nothing from them ships in the image.
+
+`gen/label_heavy.py` gathers the evidence for the heavy-test rule (for each patch that selects a heavy test: which
+cheaper selected tests fail, and does the heavy test), and `gen/heavy_table.py` tabulates how often each rule
+would drop a heavy test and how often that would be wrong. `tpcds_replay.py` replays `test_execute_tpcds` query by
+query without pytest or DuckDB; `gen/replay_eval.py` uses it as a faster source of that test's verdict, and
+`build/mkqmap.py` / `gen/qslice_stats.py` measure how many queries a patch can affect. None of these ship in the
+image.
 
 ## Pre-existing code
 

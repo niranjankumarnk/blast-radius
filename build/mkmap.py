@@ -2,13 +2,14 @@
 import json, os, pickle, sys, zlib
 HERE = os.path.dirname(os.path.abspath(__file__))
 tests = json.load(open(sys.argv[1]))["tests"]
+ISO = os.environ.get("MAP_ISO") or os.path.join(HERE, "iso"); FN = os.environ.get("MAP_FN") or os.path.join(HERE, "fn")      # (another set of tests: build/q)
 out = sys.argv[2]
 lines = {}   # file -> {line: bitset}
 reads = {}   # path -> bitset
 subproc = 0
 missing = []
 for t in tests:
-    n = t["number"]; p = os.path.join(HERE, "iso", f"{n}.json")
+    n = t["number"]; p = os.path.join(ISO, f"{n}.json")
     if not os.path.exists(p):
         missing.append(t["id"]); continue
     d = json.load(open(p)); bit = 1 << n
@@ -24,7 +25,7 @@ for t in tests:
 # Lines a test reaches only when the whole suite runs in one process (state left by earlier tests): build/suite.json,
 # written by build/suitecov.py, is {"lines": {file: {line: [test ids]}}}. Union them in.
 suite = os.path.join(HERE, "suite.json"); suite_pairs = 0
-if os.path.exists(suite):
+if os.path.exists(suite) and "MAP_ISO" not in os.environ:
     num = {t["id"]: t["number"] for t in tests}
     for f, lm in json.load(open(suite))["lines"].items():
         m = lines.setdefault(f, {})
@@ -37,7 +38,7 @@ if os.path.exists(suite):
 print("suite-only (line, test) pairs added", suite_pairs, file=sys.stderr)
 fn, inst, fn_missing = {}, {}, 0   # file -> {firstlineno: bitset}; "module:Class" -> bitset
 for t in tests:
-    p = os.path.join(HERE, "fn", f"{t['number']}.json")
+    p = os.path.join(FN, f"{t['number']}.json")
     if not os.path.exists(p):
         fn_missing |= 1 << t["number"]; continue
     d = json.load(open(p)); bit = 1 << t["number"]

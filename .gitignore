@@ -12,3 +12,12 @@ gen/sampleval/
 gen/*.log
 gen/__pycache__/
 docker.err
+build/q/iso/
+build/q/fn/
+build/q/out/
+build/q/tests.json
+build/q/*.log
+gen/replay_pinned.json
+gen/sample_replay/
+gen/heavy_files.json
+gen/set*heavy.log
