@@ -1,4 +1,4 @@
-"""For every TPC-DS query replay, the sqlglot lines that run inside PythonExecutor.execute (the data phase), each
+"""For every TPC-DS query replay, the sqlglot lines that run while a PythonExecutor is built or executes (the data phase), each
 query in its own process. Writes build/q/phase/<i>.json = {file: [lines]}.   usage: phase.py SRC [JOBS]"""
 import json, os, subprocess, sys
 from concurrent.futures import ThreadPoolExecutor
@@ -18,6 +18,14 @@ def execute(self, plan, outer_scope=None):
         depth[0] -= 1
         if not depth[0]: cov.switch_context("C")
 PythonExecutor.execute = execute
+init = PythonExecutor.__init__
+def construct(self, *a, **k):                      # building the executor is part of the data phase
+    depth[0] += 1; cov.switch_context("E")
+    try: return init(self, *a, **k)
+    finally:
+        depth[0] -= 1
+        if not depth[0]: cov.switch_context("C")
+PythonExecutor.__init__ = construct
 Replay().run(i)
 cov.stop(); d = cov.get_data(); res = {}
 for f in d.measured_files():

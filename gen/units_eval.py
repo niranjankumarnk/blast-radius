@@ -17,12 +17,15 @@ def truth_items():
     for c, a in ans.items(): yield "sample", c, os.path.join(ROOT, "sample/commits", c + ".patch"), set(a["failing"])
     for sd in sys.argv[2:]:
         d = os.path.join(ROOT, sd); done = set()
-        for sub in ("heavy", "labels"):
+        for sub in ("heavy", "h2", "labels"):
             if not os.path.isdir(os.path.join(d, sub)): continue
             for f in sorted(os.listdir(os.path.join(d, sub))):
                 if f[:-5] in done: continue
                 r = json.load(open(os.path.join(d, sub, f)))
-                if sub == "heavy":
+                if sub == "h2":
+                    if obj.test not in r["heavy_nums"]: continue
+                    failing = set(r["witness_failed_nums"]) | set(r["heavy_failed_nums"])
+                elif sub == "heavy":
                     if "heavy_nums" not in r: continue
                     names = {t["number"]: t["id"].split("::")[-1] for t in tests}
                     failing = set(r["witness_failed_nums"]) | {h for h in r["heavy_nums"] if names[h] in r["heavy_failed"]}
@@ -37,10 +40,13 @@ for src, cid, path, failing in truth_items():
     us = obj.units(text); fails = obj.test in failing
     if us is None:
         tab[("cannot be judged by units", "FAILS" if fails else "passes")] += 1; continue
+    if os.environ.get("ONLY_COMPILE") and all(f for _, f in us):
+        tab[("full (skipped here)", "", "FAILS" if fails else "passes")] += 1; continue
     edits = S.patch_edits(S.parse_patch(text))
     if edits is None: continue
     t0 = time.time(); same, bad = S.run_units(edits, obj, us, obj.estimate(us), time.time() + 600, cid)
-    tab[("no answer" if same is None else "replay: cannot fail" if same else "replay: a unit differs", "FAILS" if fails else "passes", )] += 1
+    mode = "compile-only" if not any(f for _, f in us) else "full" if all(f for _, f in us) else "mixed"
+    tab[(mode, "no answer" if same is None else "replay: cannot fail" if same else "replay: a unit differs", "FAILS" if fails else "passes", )] += 1
     if same and fails: wrong.append((src, cid))
 for k in sorted(tab): print(k, tab[k])
 print("WRONG (replay says cannot fail, the test fails):", wrong)

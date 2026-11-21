@@ -14,12 +14,13 @@ with tarfile.open(fileobj=io.BytesIO(data)) as tar:
         m.name = m.name.split("/", 1)[1]
     tar.extractall("/opt/sqlglot", members=members, filter="data")
 PY
-COPY selector.py map.bin gmap.bin qmap.bin gm_replay.py tpcds_replay.py /app/
+COPY selector.py map.bin gmap.bin qmap.bin emap.bin gm_replay.py tpcds_replay.py /app/
 RUN python -m compileall -q /opt/sqlglot/sqlglot /opt/sqlglot/tests /app
 # What the two replayable heavy tests need from every unit on the pinned commit (memory growth per dialect, a digest
 # of the DuckDB SQL and executor result per TPC-DS query) and what each unit costs in CPU, measured on this machine.
 RUN cd /opt/sqlglot && export PYTHONPATH=/opt/sqlglot:/app PYTHONDONTWRITEBYTECODE=1 SKIP_INTEGRATION=0 \
     && python /app/gm_replay.py /app/gm_expected.json && python /app/tpcds_replay.py /app/tpcds_expected.json \
     && chmod -R a+rX /opt/sqlglot /app
-ENV PYTHONDONTWRITEBYTECODE=1
+# The static selection plus the exact unit replays; no heavy test is dropped on witnesses (BR_RUN=1 would).
+ENV PYTHONDONTWRITEBYTECODE=1 BR_RUN=0
 CMD ["python", "/app/selector.py"]

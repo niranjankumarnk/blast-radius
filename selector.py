@@ -946,6 +946,10 @@ class Units:
             self.n = len(ids) - 1                                      # the last id is "harness": what only the real test executes
             self.test = next(t["number"] for t in tests if t["id"] == real)
             self.ok = len(self.exp["cost"]) == self.n
+            # emap.bin: the same units, restricted to what runs in a query's data phase (while the executor is built
+            # and executes) plus import-time code. A query whose data phase a patch cannot touch needs no execution:
+            # it is enough that the plan and tables handed to the executor, and the DuckDB SQL, are unchanged.
+            self.esel = Selector([{"id": i, "number": k} for k, i in enumerate(ids)], here / "emap.bin") if kind == "tpcds" and "cdigest" in self.exp and (here / "emap.bin").exists() else None
         except Exception as e:
             print(f"{kind}: unit replay off: {type(e).__name__}: {e}", file=sys.stderr)
 
@@ -953,11 +957,19 @@ class Units:
         """The units the patch can affect, cheapest first; None when the test cannot be judged unit by unit."""
         b = self.sel.select(patch_text)
         if not b or b == self.sel.all or b >> self.n & 1: return None
-        return sorted((u for u in range(self.n) if b >> u & 1), key=lambda u: self.exp["cost"][u])
+        full = lambda u: True
+        if getattr(self, "esel", None) is not None:
+            e = self.esel.select(patch_text)
+            if e != self.esel.all and not e >> self.n & 1: full = lambda u: bool(e >> u & 1)
+        return sorted(((u, full(u)) for u in range(self.n) if b >> u & 1), key=self.cost)
+
+    def cost(self, item):
+        return self.exp["cost" if item[1] else "ccost"][item[0]]
 
     def estimate(self, units):
-        load = sum(self.exp["load"].get(t, 0) for t in {t for u in units for t in self.exp["tables"][u]}) if self.kind == "tpcds" else 0
-        return 0.6 + 1.2 * (sum(self.exp["cost"][u] for u in units) + load)
+        """units: [(unit, True to run it in full / False to compare only what its data phase is given)]"""
+        load = sum(self.exp["load"].get(t, 0) for t in {t for u, _ in units for t in self.exp["tables"][u]}) if self.kind == "tpcds" else 0
+        return 0.6 + 1.2 * (sum(self.cost(i) for i in units) + load)
 
 
 def _units_child(root, kind, units, exp, out, tmpd):
@@ -981,12 +993,12 @@ def _units_child(root, kind, units, exp, out, tmpd):
             if kind == "tpcds":
                 from tpcds_replay import Replay
                 r = Replay()
-                check = lambda u: r.run(u) == exp["digest"][u]
+                check = lambda u, full: (r.run(u) == exp["digest"][u]) if full else (r.compile(u) == exp["cdigest"][u])
             else:
                 import gm_replay
-                check = lambda u: gm_replay.run(exp["names"][u]) <= GM_LIMIT
+                check = lambda u, full: gm_replay.run(exp["names"][u]) <= GM_LIMIT
             for u in units:
-                if not check(u): bad = u; break                        # one unit is enough to keep the test
+                if not check(*u): bad = u; break                       # one unit is enough to keep the test
         except BaseException:
             bad = units[0] if bad is None else bad
         with open(out + ".tmp", "w") as fh: json.dump({"bad": bad}, fh)
@@ -1130,7 +1142,7 @@ def main():
                 if us is None: continue
                 est = obj.estimate(us)
                 saving = (pack_cost(nums, ms) - pack_cost([n for n in nums if n != obj.test], ms)) / 1000
-                print(f"{cid}: {obj.kind} affects {len(us)} of {obj.n} units est={est:.1f} saving={saving:.1f}", file=sys.stderr)
+                print(f"{cid}: {obj.kind} affects {len(us)} of {obj.n} units ({sum(1 for _, f in us if f)} to run in full) est={est:.1f} saving={saving:.1f}", file=sys.stderr)
                 if est <= MAX_EST and est <= EXACT_RATIO * saving: ejobs.append((saving - est, cid, obj, us, est))
             except Exception as e:
                 print(f"{cid}: units {type(e).__name__}: {e}", file=sys.stderr)
@@ -1143,7 +1155,7 @@ def main():
             if same:
                 chosen[cid] = [n for n in chosen[cid] if n != obj.test]
                 print(f"{cid}: {obj.kind} cannot fail: not scheduled", file=sys.stderr)
-            elif same is False and run_units(None, obj, [bad], obj.estimate([bad]), t0 + WALL_BUDGET, cid + " (unpatched)")[0] is False:
+            elif same is False and run_units(None, obj, [tuple(bad)], obj.estimate([tuple(bad)]), t0 + WALL_BUDGET, cid + " (unpatched)")[0] is False:
                 obj.ok = False               # the unit differs here even without the patch: this container cannot replay it
         except Exception as e:
             print(f"{cid}: replay {type(e).__name__}: {e}", file=sys.stderr)

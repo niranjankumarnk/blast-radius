@@ -63,7 +63,7 @@ class Replay:
         expression = pickle.loads(pickle.dumps(parse_one(sql)))             # (the test pickles it for the worker)
         if not meta.get("execute"):
             return "parsed"
-        tables = {t.name: self.worker_table(t.name) for t in find_tables(expression)}
+        tables = {n: self.worker_table(n) for n in sorted({t.name for t in find_tables(expression)})}      # (the test's own order is arbitrary)
         schema = self.worker_schema()
         table = pickle.loads(pickle.dumps(execute(expression, schema=schema, tables=tables)))
         duck = transpile(sql, write="duckdb")[0]
@@ -84,13 +84,15 @@ class Replay:
         expression = pickle.loads(pickle.dumps(parse_one(sql)))
         if not meta.get("execute"):
             return "parsed"
-        tables = {t.name: self.worker_table(t.name) for t in find_tables(expression)}
+        tables = {n: self.worker_table(n) for n in sorted({t.name for t in find_tables(expression)})}      # (the test's own order is arbitrary)
         seen = []
+        def construct(executor, tables=None, env=None):                     # (building the executor counts as data phase)
+            seen.append(self.canon((tables, env)))
         def capture(executor, plan, outer_scope=None):
-            seen.append(self.canon((plan, executor, outer_scope)))
+            seen.append(self.canon((plan, outer_scope)))
             raise _Stop()
-        original = PythonExecutor.execute
-        PythonExecutor.execute = capture
+        original = PythonExecutor.__init__, PythonExecutor.execute
+        PythonExecutor.__init__, PythonExecutor.execute = construct, capture
         try:
             try:
                 execute(expression, schema=self.worker_schema(), tables=tables)
@@ -98,7 +100,8 @@ class Replay:
             except _Stop:
                 pass
         finally:
-            PythonExecutor.execute = original
+            PythonExecutor.__init__, PythonExecutor.execute = original
+        self.last = seen
         duck = transpile(sql, write="duckdb")[0]
         return hashlib.sha256(repr((duck, seen)).encode()).hexdigest()
 

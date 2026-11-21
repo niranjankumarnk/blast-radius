@@ -50,6 +50,13 @@ them is cheap enough, the selector does it in the container on the patched tree 
 - for a query, a digest of the DuckDB SQL and of the executor's result table, which are all that sqlglot
   contributes to the test's comparison. The image build computes the pinned commit's digests.
 
+A query runs in two phases: sqlglot parses, optimizes and plans it, then a `PythonExecutor` is built and executes
+the plan over the tables. `emap.bin` is the query map restricted to what runs in that second phase, plus import-time
+code. When a patch cannot touch a query's second phase, the query is not executed: it is enough that the plan and
+tables handed to the executor, and the DuckDB SQL, have the same canonical text as on the pinned commit, because
+unchanged code given unchanged inputs gives the unchanged result. That text is built from class names, attributes
+and containers only, and does not depend on hash seeds or object ids.
+
 If every affected unit behaves as on the pinned commit, the test cannot fail and is not scheduled. If one does
 not, or the patch touches what only the real test executes, the test stays. This is not a bet: an unaffected unit
 executes no changed code. A unit that differs is re-run on the unpatched tree; if it differs there too, the
