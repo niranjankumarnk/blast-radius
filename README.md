@@ -64,8 +64,8 @@ container cannot replay it and the mechanism turns itself off. `BR_EXACT=0` turn
 
 ## Cheap selections, verified in-process
 
-Most of what the static selection still over-schedules is patches that break nothing. For a selection without
-heavy tests, the selected tests outside `test_optimizer.py` and `test_executor.py` are run in a forked child that
+Most of what the static selection still over-schedules is patches that break nothing. The selected tests that are
+neither heavy nor in `test_optimizer.py` / `test_executor.py` are run in a forked child that
 imports the patched tree fresh and runs the test methods with unittest, without starting pytest. Tests that pass
 are not scheduled; a test that fails, errors, cannot be loaded or is not reached stays scheduled, so a failure
 caused by the container costs time, never a miss. `BR_INPROC=0` turns it off.

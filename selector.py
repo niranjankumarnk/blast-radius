@@ -1060,13 +1060,13 @@ def run_units(edits, obj, units, est, deadline, label):
 
 
 # ---- verifying a cheap selection by running it in-process -----------------------------------------------------
-# Most of what the static selection still over-schedules is patches that break nothing. For a selection without
-# heavy tests, the selected tests outside the two pandas/duckdb test files are run in a forked child: it imports
+# Most of what the static selection still over-schedules is patches that break nothing. The selected tests that
+# are neither heavy nor in the two pandas/duckdb test files are run in a forked child: it imports
 # the patched tree fresh (the parent never imports sqlglot, so nothing stale survives the fork) and runs the test
 # methods with unittest, without starting pytest. Tests that pass are not scheduled. A test that fails, errors,
 # cannot be loaded or is not reached stays scheduled, so a failure caused by the container costs time, never a miss.
 INPROC = os.environ.get("BR_INPROC", "1") == "1"
-INPROC_RATIO = float(os.environ.get("BR_INPROC_RATIO", "0.5"))
+INPROC_RATIO = float(os.environ.get("BR_INPROC_RATIO", "0.6"))
 
 
 def _inproc_child(root, ids, out, tmpd, limit):
@@ -1271,11 +1271,11 @@ def main():
     ijobs = []
     for cid, nums in chosen.items() if INPROC and not s.remap else ():
         try:
-            if cid not in texts or any(ms[n] >= HEAVY_MS for n in nums): continue
+            if cid not in texts: continue
             if not any((p or "").endswith(".py") for f in parse_patch(texts[cid]) for p in f[:2]): continue
-            run = [n for n in nums if tid[n].split("::")[0] not in POOL_FILES and tid[n].split("::")[0] not in s.resolvers() and tid[n].count("::") == 2]
+            run = [n for n in nums if ms[n] < HEAVY_MS and tid[n].split("::")[0] not in POOL_FILES and tid[n].split("::")[0] not in s.resolvers() and tid[n].count("::") == 2]
             if not run: continue
-            est = 0.5 + 1.2 * sum(ms[n] for n in run) / 1000
+            est = 0.25 + 0.6 * sum(ms[n] for n in run) / 1000            # (measured: 0.16-0.64 s for 1-6 tests under emulation)
             gain = (pack_cost(nums, ms) - pack_cost([n for n in nums if n not in set(run)], ms)) / 1000
             if est <= INPROC_RATIO * gain: ijobs.append((gain - est, cid, run, est))
         except Exception as e:
